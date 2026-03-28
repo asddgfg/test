@@ -245,7 +245,7 @@ def build_tft_model(model_name: str, cfg: Dict, work_subdir: str) -> TFTModel:
         force_reset=True,
         log_tensorboard=False,
         pl_trainer_kwargs={
-            "enable_progress_bar": False,
+            "enable_progress_bar": True,
             "logger": False,
         },
     )
