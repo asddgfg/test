@@ -42,7 +42,7 @@ FINAL_VALID_SIZE = DEFAULT_VALID_SIZE
 
 TRAINING_CONFIG = {
     "epochs": 30,
-    "batch_size": 64,
+    "batch_size": 128,
     "learning_rate": 1e-3,
     "weight_decay": 1e-5,
     "patience": 5,
