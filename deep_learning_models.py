@@ -1,4 +1,3 @@
-# deep_learning_models.py
 import torch
 import torch.nn as nn
 
@@ -46,7 +45,7 @@ class TCN(nn.Module):
         x = x.transpose(1, 2)  # -> [B, F, T]
         x = self.net(x)
 
-        # 因为padding会让长度变长，这里只取最后一个时间点
+        # Padding makes the sequence longer; use the last effective timestep.
         x = x[:, :, -1]  # -> [B, hidden_dim]
         return self.head(x)
 
@@ -87,7 +86,15 @@ class NBeats(nn.Module):
 
 # =========================================================
 # 3. Kimi-style Transformer
+# NOTE:
+# This is a lightweight causal Transformer-style baseline,
+# not an official reproduction of any proprietary Kimi model.
 # =========================================================
+def build_causal_attention_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    # True means "blocked" for nn.MultiheadAttention attn_mask.
+    return torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+
+
 class KimiBlock(nn.Module):
     def __init__(self, d_model: int, nhead: int, dropout: float, ffn_dim: int):
         super().__init__()
@@ -110,7 +117,9 @@ class KimiBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        attn_out, _ = self.attn(x, x, x)
+        seq_len = x.size(1)
+        attn_mask = build_causal_attention_mask(seq_len=seq_len, device=x.device)
+        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask)
         x = self.norm1(x + self.dropout(attn_out))
 
         ffn_out = self.ffn(x)
@@ -153,7 +162,7 @@ class KimiModel(nn.Module):
 
 
 # =========================================================
-# Model configs（small / medium / large）
+# Model configs (small / medium / large)
 # =========================================================
 def get_deep_models():
     return {

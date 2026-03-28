@@ -1,14 +1,16 @@
-# deep_train_eval.py
 import copy
+import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import (
     accuracy_score,
+    brier_score_loss,
     f1_score,
+    log_loss,
     mean_absolute_error,
     mean_squared_error,
     precision_score,
@@ -34,7 +36,9 @@ DEFAULT_SEQ_LEN = 20
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_MIN_TRAIN_SIZE = 504
 DEFAULT_VALID_SIZE = 63
-DEFAULT_STEP_SIZE = 21
+DEFAULT_STEP_SIZE = 42
+DEFAULT_SKIP_EXISTING = True
+FINAL_VALID_SIZE = DEFAULT_VALID_SIZE
 
 TRAINING_CONFIG = {
     "epochs": 30,
@@ -83,13 +87,13 @@ def create_sequences(
     date_seq = []
 
     for i in range(seq_len - 1, len(X)):
-        X_seq.append(X[i - seq_len + 1:i + 1])
+        X_seq.append(X[i - seq_len + 1 : i + 1])
         y_seq.append(y[i])
         date_seq.append(dates[i])
 
     return (
         np.asarray(X_seq, dtype=np.float32),
-        np.asarray(y_seq),
+        np.asarray(y_seq, dtype=np.float32),
         np.asarray(date_seq),
     )
 
@@ -113,8 +117,8 @@ def apply_feature_scaler(
 def scale_datasets(
     X_train_raw: np.ndarray,
     X_valid_raw: np.ndarray,
-    X_test_raw: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None, StandardScaler]:
+    X_test_raw: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], StandardScaler]:
     scaler = fit_feature_scaler(X_train_raw)
     X_train = apply_feature_scaler(scaler, X_train_raw)
     X_valid = apply_feature_scaler(scaler, X_valid_raw)
@@ -142,12 +146,11 @@ def compute_pos_weight(y_train: np.ndarray) -> torch.Tensor:
     positives = float(np.sum(y_train == 1))
     negatives = float(np.sum(y_train == 0))
 
-    if positives <= 0:
+    if positives <= 0 or negatives <= 0:
         return torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
 
     ratio = negatives / positives
-    ratio = max(ratio, 1e-6)
-    return torch.tensor(ratio, dtype=torch.float32, device=DEVICE)
+    return torch.tensor(max(ratio, 1e-6), dtype=torch.float32, device=DEVICE)
 
 
 def get_train_loss_fn(task: str, y_train: np.ndarray):
@@ -179,6 +182,9 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, floa
 
 
 def classification_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+    y_prob = np.clip(y_prob, 1e-6, 1 - 1e-6)
     y_pred = (y_prob >= 0.5).astype(int)
 
     out = {
@@ -186,6 +192,9 @@ def classification_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, 
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "brier": float(brier_score_loss(y_true, y_prob)),
+        "log_loss": float(log_loss(y_true, y_prob, labels=[0, 1])),
+        "positive_rate_pred": float(np.mean(y_pred)),
     }
 
     if len(np.unique(y_true)) > 1:
@@ -332,6 +341,14 @@ def split_dev_for_final_training(
     return X_final_train_raw, y_final_train, X_final_valid_raw, y_final_valid
 
 
+def model_checkpoint_path(dataset_name: str, model_name: str) -> str:
+    return os.path.join(MODEL_DIR, f"{dataset_name.replace('.csv', '')}__{model_name}.pt")
+
+
+def model_meta_path(dataset_name: str, model_name: str) -> str:
+    return os.path.join(MODEL_DIR, f"{dataset_name.replace('.csv', '')}__{model_name}.meta.json")
+
+
 def save_checkpoint(
     model: torch.nn.Module,
     dataset_name: str,
@@ -342,11 +359,9 @@ def save_checkpoint(
     scaler: StandardScaler,
     model_type: str,
     model_params: Dict,
+    train_config: Dict,
 ) -> str:
-    path = os.path.join(
-        MODEL_DIR,
-        f"{dataset_name.replace('.csv', '')}__{model_name}.pt",
-    )
+    path = model_checkpoint_path(dataset_name, model_name)
 
     checkpoint = {
         "model_state_dict": model.state_dict(),
@@ -357,8 +372,23 @@ def save_checkpoint(
         "scaler_scale_": scaler.scale_,
         "model_type": model_type,
         "model_params": model_params,
+        "device_used": str(DEVICE),
     }
     torch.save(checkpoint, path)
+
+    meta = {
+        "dataset": dataset_name,
+        "model": model_name,
+        "task": task,
+        "seq_len": seq_len,
+        "feature_cols": feature_cols,
+        "model_type": model_type,
+        "model_params": model_params,
+        "train_config": train_config,
+    }
+    with open(model_meta_path(dataset_name, model_name), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
     return path
 
 
@@ -369,6 +399,7 @@ def run_deep_cv_for_dataset(
     min_train_size: int = DEFAULT_MIN_TRAIN_SIZE,
     valid_size: int = DEFAULT_VALID_SIZE,
     step_size: int = DEFAULT_STEP_SIZE,
+    skip_existing: bool = DEFAULT_SKIP_EXISTING,
 ) -> pd.DataFrame:
     ensure_dirs()
 
@@ -426,7 +457,12 @@ def run_deep_cv_for_dataset(
     results = []
 
     for model_name, (model_type, model_params) in get_deep_models().items():
-        print(f"[DEEP] {file_name} / {model_name}")
+        checkpoint_path = model_checkpoint_path(file_name, model_name)
+        if skip_existing and os.path.exists(checkpoint_path):
+            print(f"[SKIP] {file_name} / {model_name} already trained: {checkpoint_path}")
+            continue
+
+        print(f"[DEEP] {file_name} / {model_name} / task={task}")
         fold_records = []
 
         # ----------------------------
@@ -490,7 +526,7 @@ def run_deep_cv_for_dataset(
         X_final_train_raw, y_final_train, X_final_valid_raw, y_final_valid = split_dev_for_final_training(
             X_dev_raw=X_dev_raw,
             y_dev=y_dev,
-            final_valid_size=valid_size,
+            final_valid_size=FINAL_VALID_SIZE,
         )
 
         X_final_train, X_final_valid, X_test, scaler = scale_datasets(
@@ -551,6 +587,16 @@ def run_deep_cv_for_dataset(
             scaler=scaler,
             model_type=model_type,
             model_params=model_params,
+            train_config={
+                **TRAINING_CONFIG,
+                "test_size": test_size,
+                "min_train_size": min_train_size,
+                "valid_size": valid_size,
+                "step_size": step_size,
+                "seq_len": seq_len,
+                "purge": purge,
+                "embargo": embargo,
+            },
         )
 
         row = {
@@ -558,6 +604,7 @@ def run_deep_cv_for_dataset(
             "task": task,
             "model": model_name,
             "model_family": "deep_learning",
+            "trained_this_run": True,
             "model_path": model_path,
             "n_dev": len(X_dev_raw),
             "n_test": len(X_test_raw),
@@ -572,12 +619,23 @@ def run_deep_cv_for_dataset(
 
 def run_all_deep(
     seq_len: int = DEFAULT_SEQ_LEN,
+    skip_existing: bool = DEFAULT_SKIP_EXISTING,
 ) -> pd.DataFrame:
     ensure_dirs()
 
     frames = []
     for file_name in DATASET_CONFIG.keys():
-        frames.append(run_deep_cv_for_dataset(file_name=file_name, seq_len=seq_len))
+        result_df = run_deep_cv_for_dataset(
+            file_name=file_name,
+            seq_len=seq_len,
+            skip_existing=skip_existing,
+        )
+        if not result_df.empty:
+            frames.append(result_df)
+
+    if not frames:
+        print("No new deep-learning models were trained.")
+        return pd.DataFrame()
 
     out = pd.concat(frames, axis=0, ignore_index=True)
     out_path = os.path.join(RESULTS_DIR, "deep_model_comparison.csv")
