@@ -93,34 +93,6 @@ def main():
     print("===== PIPELINE START =====")
     print_pipeline_summary()
 
-    # --------------------------------------------------
-    # Step 1: Data preparation
-    # --------------------------------------------------
-    if processed_datasets_exist():
-        print("[1/6] Processed datasets already exist. Skipping data preparation.")
-    else:
-        print("[1/6] Missing processed datasets. Running data preparation...")
-        output_paths = run_feature_pipeline()
-        print("Saved processed datasets:")
-        for name, path in output_paths.items():
-            print(f"  {name}: {path}")
-
-    # --------------------------------------------------
-    # Step 2: Classical ML
-    # --------------------------------------------------
-    existing_before, expected_total = count_expected_classical_models()
-
-    if all_classical_models_exist():
-        print(f"[2/6] All expected classical ML models already exist ({existing_before}/{expected_total}).")
-        print("      Skipping retraining and running evaluation only.")
-    else:
-        missing = expected_total - existing_before
-        print(f"[2/6] Missing trained classical ML models: {missing}/{expected_total}")
-        print("      Running training for missing classical ML models and evaluation for all classical ML models...")
-
-    print("[2B/6] Running classical ML evaluation / result aggregation...")
-    ml_results = run_all_datasets(split_mode="expanding")
-    print(ml_results)
 
     # --------------------------------------------------
     # Step 3: TFT (regression + classification with Platt scaling)
