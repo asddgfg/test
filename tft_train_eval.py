@@ -1,5 +1,7 @@
 import os
 import json
+import pickle
+import shutil
 import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -38,13 +40,15 @@ RESULTS_DIR = "results"
 MODEL_DIR = "models_saved_tft"
 WORK_DIR = os.path.join(MODEL_DIR, "tft_workdir")
 
-# Keep TFT focused on regression by default.
+# True: also run classification TFT on direction/regime datasets
 RUN_TFT_CLASSIFICATION = True
 
-# Main speed / robustness switch.
-# False: final train + test only (recommended for TFT)
-# True: run a very light expanding-window CV before final training
+# False: skip light CV and only do final train + test
+# True: run a small expanding-window CV before final training
 RUN_TFT_LIGHT_CV = False
+
+# If True, remove previous TFT checkpoints/workdir before running
+CLEAN_OLD_TFT_ARTIFACTS = False
 
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_MIN_TRAIN_SIZE = 504
@@ -85,7 +89,6 @@ TFT_DATASET_CONFIG = {
     },
 }
 
-# Keep small / medium / large names as requested, but use saner sizes for TFT.
 TFT_MODEL_CONFIGS = {
     "tft_small": {
         "input_chunk_length": 20,
@@ -142,6 +145,15 @@ def ensure_dirs() -> None:
     os.makedirs(WORK_DIR, exist_ok=True)
 
 
+def clean_old_artifacts_if_needed() -> None:
+    if not CLEAN_OLD_TFT_ARTIFACTS:
+        return
+
+    if os.path.exists(WORK_DIR):
+        shutil.rmtree(WORK_DIR, ignore_errors=True)
+    os.makedirs(WORK_DIR, exist_ok=True)
+
+
 def load_dataset(file_name: str) -> pd.DataFrame:
     path = os.path.join(PROCESSED_DIR, file_name)
     if not os.path.exists(path):
@@ -152,7 +164,7 @@ def load_dataset(file_name: str) -> pd.DataFrame:
         raise ValueError(f"Dataset must contain a 'Date' column: {file_name}")
 
     df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date").reset_index(drop=True)
+    df = df.sort_values("Date").drop_duplicates(subset=["Date"]).reset_index(drop=True)
 
     numeric_cols = [col for col in df.columns if col != "Date"]
     if numeric_cols:
@@ -163,7 +175,7 @@ def load_dataset(file_name: str) -> pd.DataFrame:
 
 def with_local_time_idx(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy().reset_index(drop=True)
-    out["time_idx"] = np.arange(len(out), dtype=int)
+    out["time_idx"] = np.arange(len(out), dtype=np.int64)
     return out
 
 
@@ -178,6 +190,7 @@ def get_feature_columns(df: pd.DataFrame, target_col: str) -> List[str]:
 def build_series_from_df(df: pd.DataFrame, value_cols: List[str]) -> TimeSeries:
     local_df = with_local_time_idx(df)
     local_df[value_cols] = local_df[value_cols].astype(np.float32)
+
     return TimeSeries.from_dataframe(
         local_df,
         time_col="time_idx",
@@ -199,8 +212,8 @@ def build_covariate_series(df: pd.DataFrame, feature_cols: List[str]) -> TimeSer
 
 
 def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
 
     return {
         "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
@@ -215,8 +228,8 @@ def classification_metrics(
     y_prob: np.ndarray,
     threshold: float = CLASSIFICATION_THRESHOLD,
 ) -> Dict[str, float]:
-    y_true = np.asarray(y_true).astype(int)
-    y_prob = np.asarray(y_prob).astype(float)
+    y_true = np.asarray(y_true).astype(int).reshape(-1)
+    y_prob = np.asarray(y_prob).astype(float).reshape(-1)
     y_prob = np.clip(y_prob, 1e-6, 1 - 1e-6)
     y_pred = (y_prob >= threshold).astype(int)
 
@@ -246,7 +259,8 @@ def summarize_fold_metrics(records: List[Dict[str, float]]) -> Dict[str, float]:
     summary: Dict[str, float] = {}
 
     metric_cols = [
-        col for col in df.columns
+        col
+        for col in df.columns
         if col not in {"fold", "fold_start", "fold_end"} and pd.api.types.is_numeric_dtype(df[col])
     ]
 
@@ -266,6 +280,10 @@ def meta_path(dataset_name: str, model_name: str) -> str:
     return model_path(dataset_name, model_name) + ".meta.json"
 
 
+def scaler_path(dataset_name: str, model_name: str) -> str:
+    return model_path(dataset_name, model_name) + ".scalers.pkl"
+
+
 def build_early_stopping(cfg: Dict) -> EarlyStopping:
     patience = 2 if cfg["n_epochs"] <= 8 else 3
     return EarlyStopping(
@@ -273,6 +291,14 @@ def build_early_stopping(cfg: Dict) -> EarlyStopping:
         patience=patience,
         mode="min",
     )
+
+
+def get_accelerator() -> str:
+    return "gpu" if torch.cuda.is_available() else "cpu"
+
+
+def get_precision() -> str:
+    return "bf16-mixed" if torch.cuda.is_available() else "32-true"
 
 
 def build_tft_model(
@@ -311,9 +337,9 @@ def build_tft_model(
         force_reset=True,
         log_tensorboard=False,
         pl_trainer_kwargs={
-            "accelerator": "gpu" if torch.cuda.is_available() else "cpu",
+            "accelerator": get_accelerator(),
             "devices": 1,
-            "precision": "bf16-mixed" if torch.cuda.is_available() else "32-true",
+            "precision": get_precision(),
             "gradient_clip_val": 0.5,
             "enable_progress_bar": True,
             "logger": False,
@@ -379,9 +405,12 @@ def get_historical_regression_predictions(
         verbose=False,
     )
 
+    if isinstance(preds_scaled, list):
+        preds_scaled = TimeSeries.concatenate(preds_scaled, axis=0)
+
     preds = target_scaler.inverse_transform(preds_scaled)
-    pred_values = preds.values(copy=False).flatten()
-    actual_values = combined_target_unscaled.slice_intersect(preds).values(copy=False).flatten()
+    pred_values = preds.values(copy=False).reshape(-1)
+    actual_values = combined_target_unscaled.slice_intersect(preds).values(copy=False).reshape(-1)
     return actual_values, pred_values
 
 
@@ -403,17 +432,23 @@ def get_historical_classification_predictions(
         verbose=False,
     )
 
-    logits = preds_logits.values(copy=False).flatten()
+    if isinstance(preds_logits, list):
+        preds_logits = TimeSeries.concatenate(preds_logits, axis=0)
+
+    logits = preds_logits.values(copy=False).reshape(-1)
     probs = 1.0 / (1.0 + np.exp(-logits))
-    y_true = combined_target.slice_intersect(preds_logits).values(copy=False).flatten().astype(int)
+    y_true = combined_target.slice_intersect(preds_logits).values(copy=False).reshape(-1).astype(int)
     return y_true, logits, probs
 
 
-def split_dev_for_final_training(dev_df: pd.DataFrame, final_valid_size: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def split_dev_for_final_training(
+    dev_df: pd.DataFrame,
+    final_valid_size: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if len(dev_df) <= final_valid_size:
         raise ValueError(
-            f"Development set too small for final validation split: len(dev_df)={len(dev_df)}, "
-            f"final_valid_size={final_valid_size}"
+            f"Development set too small for final validation split: "
+            f"len(dev_df)={len(dev_df)}, final_valid_size={final_valid_size}"
         )
 
     split_idx = len(dev_df) - final_valid_size
@@ -430,9 +465,21 @@ def save_tft_artifacts(
     target_col: str,
     feature_cols: List[str],
     cfg: Dict,
+    prepared: PreparedSeries,
 ) -> Dict[str, str]:
     saved_model_path = model_path(dataset_name, model_name)
+    saved_meta_path = meta_path(dataset_name, model_name)
+    saved_scaler_path = scaler_path(dataset_name, model_name)
+
     model.save(saved_model_path)
+
+    scaler_payload = {
+        "task": task,
+        "target_scaler": prepared.target_scaler,
+        "cov_scaler": prepared.cov_scaler,
+    }
+    with open(saved_scaler_path, "wb") as f:
+        pickle.dump(scaler_payload, f)
 
     metadata = {
         "dataset": dataset_name,
@@ -444,12 +491,19 @@ def save_tft_artifacts(
         "run_tft_classification": RUN_TFT_CLASSIFICATION,
         "run_tft_light_cv": RUN_TFT_LIGHT_CV,
         "classification_threshold": CLASSIFICATION_THRESHOLD if task == "classification" else None,
+        "model_path": saved_model_path,
+        "meta_path": saved_meta_path,
+        "scaler_path": saved_scaler_path,
     }
 
-    with open(meta_path(dataset_name, model_name), "w", encoding="utf-8") as f:
+    with open(saved_meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-    return {"model_path": saved_model_path}
+    return {
+        "model_path": saved_model_path,
+        "meta_path": saved_meta_path,
+        "scaler_path": saved_scaler_path,
+    }
 
 
 def fit_one_model(
@@ -485,9 +539,8 @@ def fit_one_model(
         "verbose": False,
     }
 
-    # Supported in newer Darts versions; guarded for compatibility.
     dataloader_kwargs = {
-        "num_workers": 8 if torch.cuda.is_available() else 0,
+        "num_workers": 4 if torch.cuda.is_available() else 0,
         "pin_memory": bool(torch.cuda.is_available()),
     }
     if torch.cuda.is_available() and dataloader_kwargs["num_workers"] > 0:
@@ -523,14 +576,19 @@ def fit_fold_and_score(
     )
 
     combined_df = pd.concat([train_df, valid_df], axis=0, ignore_index=True)
-    combined_cov_scaled = ensure_series_float32(prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols)))
+    combined_cov_scaled = ensure_series_float32(
+        prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+    )
 
     if task == "regression":
         if prepared.target_scaler is None:
             raise ValueError("Regression task requires a fitted target scaler.")
 
-        combined_target_scaled = ensure_series_float32(prepared.target_scaler.transform(build_target_series(combined_df, target_col)))
+        combined_target_scaled = ensure_series_float32(
+            prepared.target_scaler.transform(build_target_series(combined_df, target_col))
+        )
         combined_target_unscaled = build_target_series(combined_df, target_col)
+
         y_true, y_pred = get_historical_regression_predictions(
             model=fold_model,
             target_scaler=prepared.target_scaler,
@@ -576,14 +634,19 @@ def fit_final_and_test(
     )
 
     combined_df = pd.concat([final_train_df, final_valid_df, test_df], axis=0, ignore_index=True)
-    combined_cov_scaled = ensure_series_float32(prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols)))
+    combined_cov_scaled = ensure_series_float32(
+        prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+    )
 
     if task == "regression":
         if prepared.target_scaler is None:
             raise ValueError("Regression task requires a fitted target scaler.")
 
-        combined_target_scaled = ensure_series_float32(prepared.target_scaler.transform(build_target_series(combined_df, target_col)))
+        combined_target_scaled = ensure_series_float32(
+            prepared.target_scaler.transform(build_target_series(combined_df, target_col))
+        )
         combined_target_unscaled = build_target_series(combined_df, target_col)
+
         y_true, y_pred = get_historical_regression_predictions(
             model=final_model,
             target_scaler=prepared.target_scaler,
@@ -613,9 +676,14 @@ def fit_final_and_test(
         target_col=target_col,
         feature_cols=feature_cols,
         cfg=cfg,
+        prepared=prepared,
     )
 
-    return {**saved_paths, **test_metrics}
+    return {
+        **saved_paths,
+        "trained_this_run": True,
+        **test_metrics,
+    }
 
 
 def build_output_row(
@@ -633,7 +701,7 @@ def build_output_row(
         "task": task,
         "model": model_name,
         "model_family": "tft",
-        "trained_this_run": True,
+        "trained_this_run": bool(test_result.get("trained_this_run", True)),
         "exploratory": bool(task == "classification"),
         "light_cv_enabled": RUN_TFT_LIGHT_CV,
         "n_dev": len(dev_df),
@@ -697,8 +765,12 @@ def run_tft_cv_for_dataset(
 
     df = load_dataset(file_name)
     feature_cols = get_feature_columns(df, target_col)
+
     dev_df, test_df = train_dev_test_split(df, test_size=test_size)
-    final_train_df, final_valid_df = split_dev_for_final_training(dev_df=dev_df, final_valid_size=FINAL_VALID_SIZE)
+    final_train_df, final_valid_df = split_dev_for_final_training(
+        dev_df=dev_df,
+        final_valid_size=FINAL_VALID_SIZE,
+    )
 
     folds: List = []
     if RUN_TFT_LIGHT_CV:
@@ -742,6 +814,7 @@ def run_tft_cv_for_dataset(
                 fold_records.append(metrics)
 
         cv_summary = summarize_fold_metrics(fold_records)
+
         test_result = fit_final_and_test(
             dataset_name=file_name,
             model_name=model_name,
@@ -771,6 +844,7 @@ def run_tft_cv_for_dataset(
 
 def run_all_tft_datasets(split_mode: str = "expanding") -> pd.DataFrame:
     ensure_dirs()
+    clean_old_artifacts_if_needed()
 
     result_frames: List[pd.DataFrame] = []
     exploratory_frames: List[pd.DataFrame] = []
