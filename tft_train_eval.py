@@ -96,8 +96,8 @@ TFT_DATASET_CONFIG = {
 }
 
 # Keep TFT small. Large TFTs are usually not worth it in this setting.
-TFT_MODEL_CONFIGS = {
-    "tft_fast": {
+TFT_MODEL_CONFIGS = TFT_MODEL_CONFIGS = {
+    "tft_small": {
         "input_chunk_length": 20,
         "output_chunk_length": 1,
         "hidden_size": 8,
@@ -106,11 +106,10 @@ TFT_MODEL_CONFIGS = {
         "dropout": 0.1,
         "hidden_continuous_size": 4,
         "batch_size": 512,
-        "n_epochs": 7,
+        "n_epochs": 5,
         "learning_rate": 1e-3,
-        "patience": 2,
     },
-    "tft_small": {
+    "tft_medium": {
         "input_chunk_length": 30,
         "output_chunk_length": 1,
         "hidden_size": 16,
@@ -121,7 +120,18 @@ TFT_MODEL_CONFIGS = {
         "batch_size": 512,
         "n_epochs": 10,
         "learning_rate": 1e-3,
-        "patience": 3,
+    },
+    "tft_large": {
+        "input_chunk_length": 40,
+        "output_chunk_length": 1,
+        "hidden_size": 24,  
+        "lstm_layers": 2,
+        "num_attention_heads": 4,
+        "dropout": 0.2,
+        "hidden_continuous_size": 12,
+        "batch_size": 512,
+        "n_epochs": 15,
+        "learning_rate": 5e-4,
     },
 }
 
