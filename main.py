@@ -70,7 +70,7 @@ ROBUSTNESS_INCLUDE_CLASSICAL = True
 ROBUSTNESS_INCLUDE_DEEP = True
 ROBUSTNESS_INCLUDE_TFT = True
 
-N_BOOTSTRAP = 30
+N_BOOTSTRAP = 5
 BOOTSTRAP_METHOD = "stationary"   # "stationary", "moving", "circular"
 BOOTSTRAP_BLOCK_LENGTH = None     # None -> auto choose in submodules
 BOOTSTRAP_BASE_SEED = 42
