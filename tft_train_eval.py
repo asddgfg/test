@@ -45,7 +45,7 @@ RUN_TFT_CLASSIFICATION = True
 
 # False: skip light CV and only do final train + test
 # True: run a small expanding-window CV before final training
-RUN_TFT_LIGHT_CV = False
+RUN_TFT_LIGHT_CV = True
 
 # If True, remove previous TFT checkpoints/workdir before running
 CLEAN_OLD_TFT_ARTIFACTS = False
