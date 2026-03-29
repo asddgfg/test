@@ -1,5 +1,6 @@
 import os
 import json
+import pickle
 import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -45,6 +46,9 @@ RUN_TFT_CLASSIFICATION = True
 # False: final train + test only (recommended for TFT)
 # True: run a very light expanding-window CV before final training
 RUN_TFT_LIGHT_CV = True
+
+# New: if final model artifacts already exist, skip final training and load them directly.
+SKIP_FINAL_TRAIN_IF_ARTIFACTS_EXIST = True
 
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_MIN_TRAIN_SIZE = 504
@@ -134,6 +138,18 @@ class PreparedSeries:
     valid_cov_scaled: TimeSeries
     target_scaler: Optional[Scaler]
     cov_scaler: Scaler
+
+
+@dataclass
+class LoadedArtifacts:
+    model: TFTModel
+    task: str
+    target_col: str
+    feature_cols: List[str]
+    cfg: Dict
+    cov_scaler: Scaler
+    target_scaler: Optional[Scaler]
+    metadata: Dict
 
 
 def ensure_dirs() -> None:
@@ -264,6 +280,24 @@ def model_path(dataset_name: str, model_name: str) -> str:
 
 def meta_path(dataset_name: str, model_name: str) -> str:
     return model_path(dataset_name, model_name) + ".meta.json"
+
+
+def cov_scaler_path(dataset_name: str, model_name: str) -> str:
+    return model_path(dataset_name, model_name) + ".cov_scaler.pkl"
+
+
+def target_scaler_path(dataset_name: str, model_name: str) -> str:
+    return model_path(dataset_name, model_name) + ".target_scaler.pkl"
+
+
+def save_pickle(obj, path: str) -> None:
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def load_pickle(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def build_early_stopping(cfg: Dict) -> EarlyStopping:
@@ -430,9 +464,23 @@ def save_tft_artifacts(
     target_col: str,
     feature_cols: List[str],
     cfg: Dict,
+    cov_scaler: Scaler,
+    target_scaler: Optional[Scaler],
 ) -> Dict[str, str]:
     saved_model_path = model_path(dataset_name, model_name)
+    saved_cov_scaler_path = cov_scaler_path(dataset_name, model_name)
+    saved_target_scaler_path = target_scaler_path(dataset_name, model_name)
+
     model.save(saved_model_path)
+    save_pickle(cov_scaler, saved_cov_scaler_path)
+
+    if task == "regression":
+        if target_scaler is None:
+            raise ValueError("Regression task must save a target scaler.")
+        save_pickle(target_scaler, saved_target_scaler_path)
+    else:
+        if os.path.exists(saved_target_scaler_path):
+            os.remove(saved_target_scaler_path)
 
     metadata = {
         "dataset": dataset_name,
@@ -444,12 +492,90 @@ def save_tft_artifacts(
         "run_tft_classification": RUN_TFT_CLASSIFICATION,
         "run_tft_light_cv": RUN_TFT_LIGHT_CV,
         "classification_threshold": CLASSIFICATION_THRESHOLD if task == "classification" else None,
+        "has_target_scaler": bool(task == "regression"),
     }
 
     with open(meta_path(dataset_name, model_name), "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-    return {"model_path": saved_model_path}
+    return {
+        "model_path": saved_model_path,
+        "cov_scaler_path": saved_cov_scaler_path,
+        "target_scaler_path": saved_target_scaler_path if task == "regression" else "",
+    }
+
+
+def final_artifacts_exist(dataset_name: str, model_name: str, task: str) -> bool:
+    model_exists = os.path.exists(model_path(dataset_name, model_name))
+    meta_exists = os.path.exists(meta_path(dataset_name, model_name))
+    cov_exists = os.path.exists(cov_scaler_path(dataset_name, model_name))
+
+    if task == "regression":
+        target_exists = os.path.exists(target_scaler_path(dataset_name, model_name))
+        return model_exists and meta_exists and cov_exists and target_exists
+
+    return model_exists and meta_exists and cov_exists
+
+
+def load_tft_artifacts(
+    dataset_name: str,
+    model_name: str,
+    expected_task: str,
+    expected_target_col: str,
+    expected_feature_cols: List[str],
+    expected_cfg: Dict,
+) -> LoadedArtifacts:
+    mp = model_path(dataset_name, model_name)
+    metap = meta_path(dataset_name, model_name)
+    covp = cov_scaler_path(dataset_name, model_name)
+    targp = target_scaler_path(dataset_name, model_name)
+
+    if not final_artifacts_exist(dataset_name, model_name, expected_task):
+        raise FileNotFoundError(f"Incomplete artifacts for {dataset_name} / {model_name}")
+
+    with open(metap, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    task = metadata.get("task")
+    target_col = metadata.get("target_col")
+    feature_cols = metadata.get("feature_cols")
+    cfg = metadata.get("config")
+
+    if task != expected_task:
+        raise ValueError(
+            f"Saved task mismatch for {dataset_name} / {model_name}: "
+            f"saved={task}, expected={expected_task}"
+        )
+    if target_col != expected_target_col:
+        raise ValueError(
+            f"Saved target mismatch for {dataset_name} / {model_name}: "
+            f"saved={target_col}, expected={expected_target_col}"
+        )
+    if feature_cols != expected_feature_cols:
+        raise ValueError(
+            f"Saved feature columns mismatch for {dataset_name} / {model_name}.\n"
+            f"saved={feature_cols}\nexpected={expected_feature_cols}"
+        )
+    if cfg != expected_cfg:
+        raise ValueError(
+            f"Saved config mismatch for {dataset_name} / {model_name}.\n"
+            f"saved={cfg}\nexpected={expected_cfg}"
+        )
+
+    model = TFTModel.load(mp)
+    cov_scaler = load_pickle(covp)
+    target_scaler = load_pickle(targp) if expected_task == "regression" else None
+
+    return LoadedArtifacts(
+        model=model,
+        task=task,
+        target_col=target_col,
+        feature_cols=feature_cols,
+        cfg=cfg,
+        cov_scaler=cov_scaler,
+        target_scaler=target_scaler,
+        metadata=metadata,
+    )
 
 
 def fit_one_model(
@@ -485,7 +611,6 @@ def fit_one_model(
         "verbose": False,
     }
 
-    # Supported in newer Darts versions; guarded for compatibility.
     dataloader_kwargs = {
         "num_workers": 8 if torch.cuda.is_available() else 0,
         "pin_memory": bool(torch.cuda.is_available()),
@@ -523,13 +648,17 @@ def fit_fold_and_score(
     )
 
     combined_df = pd.concat([train_df, valid_df], axis=0, ignore_index=True)
-    combined_cov_scaled = ensure_series_float32(prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols)))
+    combined_cov_scaled = ensure_series_float32(
+        prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+    )
 
     if task == "regression":
         if prepared.target_scaler is None:
             raise ValueError("Regression task requires a fitted target scaler.")
 
-        combined_target_scaled = ensure_series_float32(prepared.target_scaler.transform(build_target_series(combined_df, target_col)))
+        combined_target_scaled = ensure_series_float32(
+            prepared.target_scaler.transform(build_target_series(combined_df, target_col))
+        )
         combined_target_unscaled = build_target_series(combined_df, target_col)
         y_true, y_pred = get_historical_regression_predictions(
             model=fold_model,
@@ -553,6 +682,61 @@ def fit_fold_and_score(
     return classification_metrics(y_true, y_prob)
 
 
+def evaluate_loaded_model_on_test(
+    loaded: LoadedArtifacts,
+    final_train_df: pd.DataFrame,
+    final_valid_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> Dict[str, float]:
+    model = loaded.model
+    task = loaded.task
+    target_col = loaded.target_col
+    feature_cols = loaded.feature_cols
+    cov_scaler = loaded.cov_scaler
+    target_scaler = loaded.target_scaler
+
+    combined_df = pd.concat([final_train_df, final_valid_df, test_df], axis=0, ignore_index=True)
+    combined_cov_scaled = ensure_series_float32(
+        cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+    )
+
+    if task == "regression":
+        if target_scaler is None:
+            raise ValueError("Loaded regression model is missing target scaler.")
+
+        combined_target_scaled = ensure_series_float32(
+            target_scaler.transform(build_target_series(combined_df, target_col))
+        )
+        combined_target_unscaled = build_target_series(combined_df, target_col)
+
+        y_true, y_pred = get_historical_regression_predictions(
+            model=model,
+            target_scaler=target_scaler,
+            combined_target_scaled=combined_target_scaled,
+            combined_cov_scaled=combined_cov_scaled,
+            combined_target_unscaled=combined_target_unscaled,
+            start_time=len(final_train_df) + len(final_valid_df),
+            stride=TEST_HISTORICAL_STRIDE,
+        )
+        test_metrics = regression_metrics(y_true, y_pred)
+    else:
+        combined_target = build_target_series(combined_df, target_col)
+        y_true, _, y_prob = get_historical_classification_predictions(
+            model=model,
+            combined_target=combined_target,
+            combined_cov_scaled=combined_cov_scaled,
+            start_time=len(final_train_df) + len(final_valid_df),
+            stride=TEST_HISTORICAL_STRIDE,
+        )
+        test_metrics = classification_metrics(y_true, y_prob)
+
+    return {
+        "model_path": model_path(loaded.metadata["dataset"], loaded.metadata["model"]),
+        "trained_this_run": False,
+        **test_metrics,
+    }
+
+
 def fit_final_and_test(
     dataset_name: str,
     model_name: str,
@@ -564,6 +748,26 @@ def fit_final_and_test(
     target_col: str,
     feature_cols: List[str],
 ) -> Dict[str, float]:
+    if SKIP_FINAL_TRAIN_IF_ARTIFACTS_EXIST and final_artifacts_exist(dataset_name, model_name, task):
+        try:
+            loaded = load_tft_artifacts(
+                dataset_name=dataset_name,
+                model_name=model_name,
+                expected_task=task,
+                expected_target_col=target_col,
+                expected_feature_cols=feature_cols,
+                expected_cfg=cfg,
+            )
+            print(f"[SKIP TRAIN] Loaded existing TFT artifacts: {dataset_name} / {model_name}")
+            return evaluate_loaded_model_on_test(
+                loaded=loaded,
+                final_train_df=final_train_df,
+                final_valid_df=final_valid_df,
+                test_df=test_df,
+            )
+        except Exception as e:
+            print(f"[RETRAIN] Existing TFT artifacts unusable for {dataset_name} / {model_name}: {e}")
+
     final_model, prepared = fit_one_model(
         dataset_name=dataset_name,
         model_name=f"{dataset_name.replace('.csv', '')}__{model_name}",
@@ -576,13 +780,17 @@ def fit_final_and_test(
     )
 
     combined_df = pd.concat([final_train_df, final_valid_df, test_df], axis=0, ignore_index=True)
-    combined_cov_scaled = ensure_series_float32(prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols)))
+    combined_cov_scaled = ensure_series_float32(
+        prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+    )
 
     if task == "regression":
         if prepared.target_scaler is None:
             raise ValueError("Regression task requires a fitted target scaler.")
 
-        combined_target_scaled = ensure_series_float32(prepared.target_scaler.transform(build_target_series(combined_df, target_col)))
+        combined_target_scaled = ensure_series_float32(
+            prepared.target_scaler.transform(build_target_series(combined_df, target_col))
+        )
         combined_target_unscaled = build_target_series(combined_df, target_col)
         y_true, y_pred = get_historical_regression_predictions(
             model=final_model,
@@ -613,9 +821,11 @@ def fit_final_and_test(
         target_col=target_col,
         feature_cols=feature_cols,
         cfg=cfg,
+        cov_scaler=prepared.cov_scaler,
+        target_scaler=prepared.target_scaler,
     )
 
-    return {**saved_paths, **test_metrics}
+    return {**saved_paths, "trained_this_run": True, **test_metrics}
 
 
 def build_output_row(
@@ -633,7 +843,7 @@ def build_output_row(
         "task": task,
         "model": model_name,
         "model_family": "tft",
-        "trained_this_run": True,
+        "trained_this_run": bool(test_result.get("trained_this_run", True)),
         "exploratory": bool(task == "classification"),
         "light_cv_enabled": RUN_TFT_LIGHT_CV,
         "n_dev": len(dev_df),
@@ -721,6 +931,7 @@ def run_tft_cv_for_dataset(
         print(f"[TFT] {file_name} / {model_name} / task={task}")
         fold_records: List[Dict[str, float]] = []
 
+        # Light CV fold models are not persisted/reused.
         if RUN_TFT_LIGHT_CV:
             for i, fold in enumerate(folds, start=1):
                 train_df = dev_df.iloc[fold.train_idx].reset_index(drop=True)
