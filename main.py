@@ -94,6 +94,10 @@ def main():
     print_pipeline_summary()
 
 
+    print("[3/6] Running TFT evaluation / result aggregation...")
+    tft_results = run_all_tft_datasets(split_mode="expanding")
+    print(tft_results)
+
     print("[4/6] Running deep learning evaluation / result aggregation...")
     deep_results = run_all_deep()
     print(deep_results)
