@@ -465,7 +465,11 @@ def run_deep_cv_for_dataset(
             # ----------------------------
             # LOAD MODEL
             # ----------------------------
-            checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location=DEVICE,
+                weights_only=False,
+            )
 
             model = build_model(
                 model_type=checkpoint["model_type"],
