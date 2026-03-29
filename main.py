@@ -94,16 +94,6 @@ def main():
     print_pipeline_summary()
 
 
-    # --------------------------------------------------
-    # Step 3: TFT (regression + classification with Platt scaling)
-    # --------------------------------------------------
-    print("[3/6] Running TFT evaluation / result aggregation...")
-    tft_results = run_all_tft_datasets(split_mode="expanding")
-    print(tft_results)
-
-    # --------------------------------------------------
-    # Step 4: Other deep learning models
-    # --------------------------------------------------
     print("[4/6] Running deep learning evaluation / result aggregation...")
     deep_results = run_all_deep()
     print(deep_results)
