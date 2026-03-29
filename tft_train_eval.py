@@ -1,9 +1,12 @@
-import os
+# tft_train_eval.py
+from __future__ import annotations
+
 import json
+import os
 import pickle
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,18 +16,19 @@ from darts.dataprocessing.transformers import Scaler
 from darts.models import TFTModel
 from pytorch_lightning.callbacks import EarlyStopping
 from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    f1_score,
+    log_loss,
     mean_absolute_error,
     mean_squared_error,
-    r2_score,
-    accuracy_score,
     precision_score,
+    r2_score,
     recall_score,
-    f1_score,
     roc_auc_score,
-    log_loss,
-    brier_score_loss,
 )
 
+from bootstrap_utils import BootstrapSample, iter_bootstrap_samples, suggest_block_length
 from splitter import expanding_window_splits, train_dev_test_split
 
 
@@ -39,15 +43,12 @@ RESULTS_DIR = "results"
 MODEL_DIR = "models_saved_tft"
 WORK_DIR = os.path.join(MODEL_DIR, "tft_workdir")
 
-# Keep TFT focused on regression by default.
+ROBUSTNESS_DIR = os.path.join(MODEL_DIR, "robustness")
+ROBUSTNESS_RESULTS_DIR = os.path.join(RESULTS_DIR, "robustness")
+ROBUSTNESS_WORK_DIR = os.path.join(ROBUSTNESS_DIR, "tft_workdir")
+
 RUN_TFT_CLASSIFICATION = True
-
-# Main speed / robustness switch.
-# False: final train + test only (recommended for TFT)
-# True: run a very light expanding-window CV before final training
 RUN_TFT_LIGHT_CV = True
-
-# New: if final model artifacts already exist, skip final training and load them directly.
 SKIP_FINAL_TRAIN_IF_ARTIFACTS_EXIST = True
 
 DEFAULT_TEST_SIZE = 0.2
@@ -89,7 +90,6 @@ TFT_DATASET_CONFIG = {
     },
 }
 
-# Keep small / medium / large names as requested, but use saner sizes for TFT.
 TFT_MODEL_CONFIGS = {
     "tft_small": {
         "input_chunk_length": 20,
@@ -152,10 +152,25 @@ class LoadedArtifacts:
     metadata: Dict
 
 
+@dataclass
+class TFTBundle:
+    file_name: str
+    df: pd.DataFrame
+    dev_df: pd.DataFrame
+    test_df: pd.DataFrame
+    target_col: str
+    task: str
+    feature_cols: List[str]
+    folds: List
+
+
 def ensure_dirs() -> None:
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(WORK_DIR, exist_ok=True)
+    os.makedirs(ROBUSTNESS_DIR, exist_ok=True)
+    os.makedirs(ROBUSTNESS_RESULTS_DIR, exist_ok=True)
+    os.makedirs(ROBUSTNESS_WORK_DIR, exist_ok=True)
 
 
 def load_dataset(file_name: str) -> pd.DataFrame:
@@ -273,21 +288,22 @@ def summarize_fold_metrics(records: List[Dict[str, float]]) -> Dict[str, float]:
     return summary
 
 
-def model_path(dataset_name: str, model_name: str) -> str:
+def model_path(dataset_name: str, model_name: str, save_dir: str = MODEL_DIR, suffix: str = "") -> str:
     safe_dataset = dataset_name.replace(".csv", "")
-    return os.path.join(MODEL_DIR, f"{safe_dataset}__{model_name}.pt")
+    safe_suffix = f"__{suffix}" if suffix else ""
+    return os.path.join(save_dir, f"{safe_dataset}__{model_name}{safe_suffix}.pt")
 
 
-def meta_path(dataset_name: str, model_name: str) -> str:
-    return model_path(dataset_name, model_name) + ".meta.json"
+def meta_path(dataset_name: str, model_name: str, save_dir: str = MODEL_DIR, suffix: str = "") -> str:
+    return model_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix) + ".meta.json"
 
 
-def cov_scaler_path(dataset_name: str, model_name: str) -> str:
-    return model_path(dataset_name, model_name) + ".cov_scaler.pkl"
+def cov_scaler_path(dataset_name: str, model_name: str, save_dir: str = MODEL_DIR, suffix: str = "") -> str:
+    return model_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix) + ".cov_scaler.pkl"
 
 
-def target_scaler_path(dataset_name: str, model_name: str) -> str:
-    return model_path(dataset_name, model_name) + ".target_scaler.pkl"
+def target_scaler_path(dataset_name: str, model_name: str, save_dir: str = MODEL_DIR, suffix: str = "") -> str:
+    return model_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix) + ".target_scaler.pkl"
 
 
 def save_pickle(obj, path: str) -> None:
@@ -466,10 +482,15 @@ def save_tft_artifacts(
     cfg: Dict,
     cov_scaler: Scaler,
     target_scaler: Optional[Scaler],
+    save_dir: str = MODEL_DIR,
+    suffix: str = "",
+    extra_meta: Optional[Dict] = None,
 ) -> Dict[str, str]:
-    saved_model_path = model_path(dataset_name, model_name)
-    saved_cov_scaler_path = cov_scaler_path(dataset_name, model_name)
-    saved_target_scaler_path = target_scaler_path(dataset_name, model_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    saved_model_path = model_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix)
+    saved_cov_scaler_path = cov_scaler_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix)
+    saved_target_scaler_path = target_scaler_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix)
 
     model.save(saved_model_path)
     save_pickle(cov_scaler, saved_cov_scaler_path)
@@ -494,8 +515,10 @@ def save_tft_artifacts(
         "classification_threshold": CLASSIFICATION_THRESHOLD if task == "classification" else None,
         "has_target_scaler": bool(task == "regression"),
     }
+    if extra_meta:
+        metadata.update(extra_meta)
 
-    with open(meta_path(dataset_name, model_name), "w", encoding="utf-8") as f:
+    with open(meta_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix), "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     return {
@@ -505,13 +528,19 @@ def save_tft_artifacts(
     }
 
 
-def final_artifacts_exist(dataset_name: str, model_name: str, task: str) -> bool:
-    model_exists = os.path.exists(model_path(dataset_name, model_name))
-    meta_exists = os.path.exists(meta_path(dataset_name, model_name))
-    cov_exists = os.path.exists(cov_scaler_path(dataset_name, model_name))
+def final_artifacts_exist(
+    dataset_name: str,
+    model_name: str,
+    task: str,
+    save_dir: str = MODEL_DIR,
+    suffix: str = "",
+) -> bool:
+    model_exists = os.path.exists(model_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix))
+    meta_exists = os.path.exists(meta_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix))
+    cov_exists = os.path.exists(cov_scaler_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix))
 
     if task == "regression":
-        target_exists = os.path.exists(target_scaler_path(dataset_name, model_name))
+        target_exists = os.path.exists(target_scaler_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix))
         return model_exists and meta_exists and cov_exists and target_exists
 
     return model_exists and meta_exists and cov_exists
@@ -524,13 +553,15 @@ def load_tft_artifacts(
     expected_target_col: str,
     expected_feature_cols: List[str],
     expected_cfg: Dict,
+    save_dir: str = MODEL_DIR,
+    suffix: str = "",
 ) -> LoadedArtifacts:
-    mp = model_path(dataset_name, model_name)
-    metap = meta_path(dataset_name, model_name)
-    covp = cov_scaler_path(dataset_name, model_name)
-    targp = target_scaler_path(dataset_name, model_name)
+    mp = model_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix)
+    metap = meta_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix)
+    covp = cov_scaler_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix)
+    targp = target_scaler_path(dataset_name, model_name, save_dir=save_dir, suffix=suffix)
 
-    if not final_artifacts_exist(dataset_name, model_name, expected_task):
+    if not final_artifacts_exist(dataset_name, model_name, expected_task, save_dir=save_dir, suffix=suffix):
         raise FileNotFoundError(f"Incomplete artifacts for {dataset_name} / {model_name}")
 
     with open(metap, "r", encoding="utf-8") as f:
@@ -587,6 +618,7 @@ def fit_one_model(
     valid_df: pd.DataFrame,
     target_col: str,
     feature_cols: List[str],
+    work_dir: str,
 ) -> Tuple[TFTModel, PreparedSeries]:
     prepared = prepare_scaled_series(
         train_df=train_df,
@@ -600,7 +632,7 @@ def fit_one_model(
         model_name=model_name,
         cfg=cfg,
         task=task,
-        work_subdir=WORK_DIR,
+        work_subdir=work_dir,
     )
 
     fit_kwargs = {
@@ -626,6 +658,53 @@ def fit_one_model(
     return model, prepared
 
 
+def build_tft_bundle(
+    file_name: str,
+    test_size: float = DEFAULT_TEST_SIZE,
+    min_train_size: int = DEFAULT_MIN_TRAIN_SIZE,
+    valid_size: int = DEFAULT_VALID_SIZE,
+    step_size: int = DEFAULT_STEP_SIZE,
+) -> TFTBundle:
+    config = TFT_DATASET_CONFIG[file_name]
+    target_col = config["target"]
+    task = config["task"]
+    purge = config["purge"]
+    embargo = config["embargo"]
+
+    df = load_dataset(file_name)
+    feature_cols = get_feature_columns(df, target_col)
+
+    dev_df, test_df = train_dev_test_split(df, test_size=test_size)
+
+    folds = list(
+        expanding_window_splits(
+            n_samples=len(dev_df),
+            min_train_size=min_train_size,
+            valid_size=valid_size,
+            step_size=step_size,
+            purge=purge,
+            embargo=embargo,
+        )
+    )
+
+    if len(folds) == 0:
+        raise ValueError(
+            f"No valid folds for {file_name}. "
+            f"Check dataset size and split parameters."
+        )
+
+    return TFTBundle(
+        file_name=file_name,
+        df=df,
+        dev_df=dev_df,
+        test_df=test_df,
+        target_col=target_col,
+        task=task,
+        feature_cols=feature_cols,
+        folds=folds,
+    )
+
+
 def fit_fold_and_score(
     dataset_name: str,
     model_name: str,
@@ -635,186 +714,88 @@ def fit_fold_and_score(
     valid_df: pd.DataFrame,
     target_col: str,
     feature_cols: List[str],
+    work_dir: str,
 ) -> Dict[str, float]:
-    fold_model, prepared = fit_one_model(
+    model, prepared = fit_one_model(
         dataset_name=dataset_name,
-        model_name=f"{dataset_name.replace('.csv', '')}__{model_name}__fold",
+        model_name=model_name,
         cfg=cfg,
         task=task,
         train_df=train_df,
         valid_df=valid_df,
         target_col=target_col,
         feature_cols=feature_cols,
+        work_dir=work_dir,
     )
 
-    combined_df = pd.concat([train_df, valid_df], axis=0, ignore_index=True)
-    combined_cov_scaled = ensure_series_float32(
-        prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
-    )
+    combined_df = pd.concat([train_df, valid_df], axis=0).reset_index(drop=True)
 
     if task == "regression":
-        if prepared.target_scaler is None:
-            raise ValueError("Regression task requires a fitted target scaler.")
-
         combined_target_scaled = ensure_series_float32(
             prepared.target_scaler.transform(build_target_series(combined_df, target_col))
         )
+        combined_cov_scaled = ensure_series_float32(
+            prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+        )
         combined_target_unscaled = build_target_series(combined_df, target_col)
+
+        start_time = len(train_df)
         y_true, y_pred = get_historical_regression_predictions(
-            model=fold_model,
+            model=model,
             target_scaler=prepared.target_scaler,
             combined_target_scaled=combined_target_scaled,
             combined_cov_scaled=combined_cov_scaled,
             combined_target_unscaled=combined_target_unscaled,
-            start_time=len(train_df),
+            start_time=start_time,
             stride=CV_HISTORICAL_STRIDE,
         )
         return regression_metrics(y_true, y_pred)
 
     combined_target = build_target_series(combined_df, target_col)
+    combined_cov_scaled = ensure_series_float32(
+        prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+    )
+    start_time = len(train_df)
     y_true, _, y_prob = get_historical_classification_predictions(
-        model=fold_model,
+        model=model,
         combined_target=combined_target,
         combined_cov_scaled=combined_cov_scaled,
-        start_time=len(train_df),
+        start_time=start_time,
         stride=CV_HISTORICAL_STRIDE,
     )
     return classification_metrics(y_true, y_prob)
 
 
-def evaluate_loaded_model_on_test(
-    loaded: LoadedArtifacts,
-    final_train_df: pd.DataFrame,
-    final_valid_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-) -> Dict[str, float]:
-    model = loaded.model
-    task = loaded.task
-    target_col = loaded.target_col
-    feature_cols = loaded.feature_cols
-    cov_scaler = loaded.cov_scaler
-    target_scaler = loaded.target_scaler
-
-    combined_df = pd.concat([final_train_df, final_valid_df, test_df], axis=0, ignore_index=True)
-    combined_cov_scaled = ensure_series_float32(
-        cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
-    )
-
-    if task == "regression":
-        if target_scaler is None:
-            raise ValueError("Loaded regression model is missing target scaler.")
-
-        combined_target_scaled = ensure_series_float32(
-            target_scaler.transform(build_target_series(combined_df, target_col))
-        )
-        combined_target_unscaled = build_target_series(combined_df, target_col)
-
-        y_true, y_pred = get_historical_regression_predictions(
-            model=model,
-            target_scaler=target_scaler,
-            combined_target_scaled=combined_target_scaled,
-            combined_cov_scaled=combined_cov_scaled,
-            combined_target_unscaled=combined_target_unscaled,
-            start_time=len(final_train_df) + len(final_valid_df),
-            stride=TEST_HISTORICAL_STRIDE,
-        )
-        test_metrics = regression_metrics(y_true, y_pred)
-    else:
-        combined_target = build_target_series(combined_df, target_col)
-        y_true, _, y_prob = get_historical_classification_predictions(
-            model=model,
-            combined_target=combined_target,
-            combined_cov_scaled=combined_cov_scaled,
-            start_time=len(final_train_df) + len(final_valid_df),
-            stride=TEST_HISTORICAL_STRIDE,
-        )
-        test_metrics = classification_metrics(y_true, y_prob)
-
-    return {
-        "model_path": model_path(loaded.metadata["dataset"], loaded.metadata["model"]),
-        "trained_this_run": False,
-        **test_metrics,
-    }
-
-
-def fit_final_and_test(
+def final_fit_and_test(
     dataset_name: str,
     model_name: str,
     cfg: Dict,
     task: str,
-    final_train_df: pd.DataFrame,
-    final_valid_df: pd.DataFrame,
+    dev_df: pd.DataFrame,
     test_df: pd.DataFrame,
     target_col: str,
     feature_cols: List[str],
-) -> Dict[str, float]:
-    if SKIP_FINAL_TRAIN_IF_ARTIFACTS_EXIST and final_artifacts_exist(dataset_name, model_name, task):
-        try:
-            loaded = load_tft_artifacts(
-                dataset_name=dataset_name,
-                model_name=model_name,
-                expected_task=task,
-                expected_target_col=target_col,
-                expected_feature_cols=feature_cols,
-                expected_cfg=cfg,
-            )
-            print(f"[SKIP TRAIN] Loaded existing TFT artifacts: {dataset_name} / {model_name}")
-            return evaluate_loaded_model_on_test(
-                loaded=loaded,
-                final_train_df=final_train_df,
-                final_valid_df=final_valid_df,
-                test_df=test_df,
-            )
-        except Exception as e:
-            print(f"[RETRAIN] Existing TFT artifacts unusable for {dataset_name} / {model_name}: {e}")
+    save_dir: str = MODEL_DIR,
+    suffix: str = "",
+    work_dir: str = WORK_DIR,
+    extra_meta: Optional[Dict] = None,
+) -> Dict[str, object]:
+    final_train_df, final_valid_df = split_dev_for_final_training(dev_df, FINAL_VALID_SIZE)
 
-    final_model, prepared = fit_one_model(
+    model, prepared = fit_one_model(
         dataset_name=dataset_name,
-        model_name=f"{dataset_name.replace('.csv', '')}__{model_name}",
+        model_name=model_name,
         cfg=cfg,
         task=task,
         train_df=final_train_df,
         valid_df=final_valid_df,
         target_col=target_col,
         feature_cols=feature_cols,
+        work_dir=work_dir,
     )
-
-    combined_df = pd.concat([final_train_df, final_valid_df, test_df], axis=0, ignore_index=True)
-    combined_cov_scaled = ensure_series_float32(
-        prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
-    )
-
-    if task == "regression":
-        if prepared.target_scaler is None:
-            raise ValueError("Regression task requires a fitted target scaler.")
-
-        combined_target_scaled = ensure_series_float32(
-            prepared.target_scaler.transform(build_target_series(combined_df, target_col))
-        )
-        combined_target_unscaled = build_target_series(combined_df, target_col)
-        y_true, y_pred = get_historical_regression_predictions(
-            model=final_model,
-            target_scaler=prepared.target_scaler,
-            combined_target_scaled=combined_target_scaled,
-            combined_cov_scaled=combined_cov_scaled,
-            combined_target_unscaled=combined_target_unscaled,
-            start_time=len(final_train_df) + len(final_valid_df),
-            stride=TEST_HISTORICAL_STRIDE,
-        )
-        test_metrics = regression_metrics(y_true, y_pred)
-    else:
-        combined_target = build_target_series(combined_df, target_col)
-        y_true, _, y_prob = get_historical_classification_predictions(
-            model=final_model,
-            combined_target=combined_target,
-            combined_cov_scaled=combined_cov_scaled,
-            start_time=len(final_train_df) + len(final_valid_df),
-            stride=TEST_HISTORICAL_STRIDE,
-        )
-        test_metrics = classification_metrics(y_true, y_prob)
 
     saved_paths = save_tft_artifacts(
-        model=final_model,
+        model=model,
         dataset_name=dataset_name,
         model_name=model_name,
         task=task,
@@ -823,129 +804,184 @@ def fit_final_and_test(
         cfg=cfg,
         cov_scaler=prepared.cov_scaler,
         target_scaler=prepared.target_scaler,
+        save_dir=save_dir,
+        suffix=suffix,
+        extra_meta=extra_meta,
     )
 
-    return {**saved_paths, "trained_this_run": True, **test_metrics}
-
-
-def build_output_row(
-    file_name: str,
-    task: str,
-    model_name: str,
-    dev_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    folds: List,
-    cv_summary: Dict[str, float],
-    test_result: Dict[str, float],
-) -> Dict[str, object]:
-    row: Dict[str, object] = {
-        "dataset": file_name,
-        "task": task,
-        "model": model_name,
-        "model_family": "tft",
-        "trained_this_run": bool(test_result.get("trained_this_run", True)),
-        "exploratory": bool(task == "classification"),
-        "light_cv_enabled": RUN_TFT_LIGHT_CV,
-        "n_dev": len(dev_df),
-        "n_test": len(test_df),
-        "n_folds": len(folds),
-        **cv_summary,
-        "model_path": test_result["model_path"],
-    }
+    combined_df = pd.concat([dev_df, test_df], axis=0).reset_index(drop=True)
 
     if task == "regression":
-        row.update(
-            {
-                "test_rmse": test_result["rmse"],
-                "test_mae": test_result["mae"],
-                "test_oos_r2": test_result["oos_r2"],
-                "test_directional_accuracy": test_result["directional_accuracy"],
-            }
+        combined_target_scaled = ensure_series_float32(
+            prepared.target_scaler.transform(build_target_series(combined_df, target_col))
         )
-    else:
-        row.update(
-            {
-                "test_accuracy": test_result["accuracy"],
-                "test_precision": test_result["precision"],
-                "test_recall": test_result["recall"],
-                "test_f1": test_result["f1"],
-                "test_roc_auc": test_result["roc_auc"],
-                "test_brier": test_result["brier"],
-                "test_log_loss": test_result["log_loss"],
-                "test_positive_rate_pred": test_result["positive_rate_pred"],
-                "test_positive_rate_true": test_result["positive_rate_true"],
-            }
+        combined_cov_scaled = ensure_series_float32(
+            prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
         )
+        combined_target_unscaled = build_target_series(combined_df, target_col)
 
-    return row
+        start_time = len(dev_df)
+        y_true, y_pred = get_historical_regression_predictions(
+            model=model,
+            target_scaler=prepared.target_scaler,
+            combined_target_scaled=combined_target_scaled,
+            combined_cov_scaled=combined_cov_scaled,
+            combined_target_unscaled=combined_target_unscaled,
+            start_time=start_time,
+            stride=TEST_HISTORICAL_STRIDE,
+        )
+        test_metrics = regression_metrics(y_true, y_pred)
+    else:
+        combined_target = build_target_series(combined_df, target_col)
+        combined_cov_scaled = ensure_series_float32(
+            prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+        )
+        start_time = len(dev_df)
+        y_true, _, y_prob = get_historical_classification_predictions(
+            model=model,
+            combined_target=combined_target,
+            combined_cov_scaled=combined_cov_scaled,
+            start_time=start_time,
+            stride=TEST_HISTORICAL_STRIDE,
+        )
+        test_metrics = classification_metrics(y_true, y_prob)
+
+    return {
+        "model_path": saved_paths["model_path"],
+        "cov_scaler_path": saved_paths["cov_scaler_path"],
+        "target_scaler_path": saved_paths["target_scaler_path"],
+        **{f"test_{k}": v for k, v in test_metrics.items()},
+    }
+
+
+def evaluate_loaded_artifacts_on_test(
+    artifacts: LoadedArtifacts,
+    dev_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> Dict[str, float]:
+    combined_df = pd.concat([dev_df, test_df], axis=0).reset_index(drop=True)
+
+    if artifacts.task == "regression":
+        combined_target_scaled = ensure_series_float32(
+            artifacts.target_scaler.transform(build_target_series(combined_df, artifacts.target_col))
+        )
+        combined_cov_scaled = ensure_series_float32(
+            artifacts.cov_scaler.transform(build_covariate_series(combined_df, artifacts.feature_cols))
+        )
+        combined_target_unscaled = build_target_series(combined_df, artifacts.target_col)
+
+        start_time = len(dev_df)
+        y_true, y_pred = get_historical_regression_predictions(
+            model=artifacts.model,
+            target_scaler=artifacts.target_scaler,
+            combined_target_scaled=combined_target_scaled,
+            combined_cov_scaled=combined_cov_scaled,
+            combined_target_unscaled=combined_target_unscaled,
+            start_time=start_time,
+            stride=TEST_HISTORICAL_STRIDE,
+        )
+        return regression_metrics(y_true, y_pred)
+
+    combined_target = build_target_series(combined_df, artifacts.target_col)
+    combined_cov_scaled = ensure_series_float32(
+        artifacts.cov_scaler.transform(build_covariate_series(combined_df, artifacts.feature_cols))
+    )
+    start_time = len(dev_df)
+    y_true, _, y_prob = get_historical_classification_predictions(
+        model=artifacts.model,
+        combined_target=combined_target,
+        combined_cov_scaled=combined_cov_scaled,
+        start_time=start_time,
+        stride=TEST_HISTORICAL_STRIDE,
+    )
+    return classification_metrics(y_true, y_prob)
 
 
 def run_tft_cv_for_dataset(
     file_name: str,
-    split_mode: str = "expanding",
     test_size: float = DEFAULT_TEST_SIZE,
     min_train_size: int = DEFAULT_MIN_TRAIN_SIZE,
     valid_size: int = DEFAULT_VALID_SIZE,
     step_size: int = DEFAULT_STEP_SIZE,
+    force_retrain: bool = False,
+    save_dir: str = MODEL_DIR,
+    result_dir: str = RESULTS_DIR,
+    work_dir: str = WORK_DIR,
 ) -> pd.DataFrame:
     ensure_dirs()
 
-    if split_mode != "expanding":
-        raise ValueError("This TFT version only supports split_mode='expanding'.")
+    bundle = build_tft_bundle(
+        file_name=file_name,
+        test_size=test_size,
+        min_train_size=min_train_size,
+        valid_size=valid_size,
+        step_size=step_size,
+    )
 
-    if file_name not in TFT_DATASET_CONFIG:
-        raise ValueError(f"Unknown dataset config: {file_name}")
-
-    config = TFT_DATASET_CONFIG[file_name]
-    target_col = config["target"]
-    task = config["task"]
-    purge = config["purge"]
-    embargo = config["embargo"]
-
-    if task == "classification" and not RUN_TFT_CLASSIFICATION:
-        return pd.DataFrame()
-
-    df = load_dataset(file_name)
-    feature_cols = get_feature_columns(df, target_col)
-    dev_df, test_df = train_dev_test_split(df, test_size=test_size)
-    final_train_df, final_valid_df = split_dev_for_final_training(dev_df=dev_df, final_valid_size=FINAL_VALID_SIZE)
-
-    folds: List = []
-    if RUN_TFT_LIGHT_CV:
-        folds = list(
-            expanding_window_splits(
-                n_samples=len(dev_df),
-                min_train_size=min_train_size,
-                valid_size=valid_size,
-                step_size=step_size,
-                purge=purge,
-                embargo=embargo,
-            )
-        )
-        if len(folds) > 5:
-            folds = folds[-5:]
-
-    all_results: List[Dict[str, object]] = []
+    rows = []
 
     for model_name, cfg in TFT_MODEL_CONFIGS.items():
-        print(f"[TFT] {file_name} / {model_name} / task={task}")
-        fold_records: List[Dict[str, float]] = []
+        if bundle.task == "classification" and not RUN_TFT_CLASSIFICATION:
+            continue
 
-        # Light CV fold models are not persisted/reused.
+        artifacts_exist = final_artifacts_exist(
+            dataset_name=bundle.file_name,
+            model_name=model_name,
+            task=bundle.task,
+            save_dir=save_dir,
+        )
+
+        if artifacts_exist and SKIP_FINAL_TRAIN_IF_ARTIFACTS_EXIST and not force_retrain:
+            print(f"[SKIP TRAIN] {bundle.file_name} / {model_name} using saved final artifacts")
+            artifacts = load_tft_artifacts(
+                dataset_name=bundle.file_name,
+                model_name=model_name,
+                expected_task=bundle.task,
+                expected_target_col=bundle.target_col,
+                expected_feature_cols=bundle.feature_cols,
+                expected_cfg=cfg,
+                save_dir=save_dir,
+            )
+
+            test_metrics = evaluate_loaded_artifacts_on_test(
+                artifacts=artifacts,
+                dev_df=bundle.dev_df,
+                test_df=bundle.test_df,
+            )
+
+            row = {
+                "dataset": bundle.file_name,
+                "task": bundle.task,
+                "model": model_name,
+                "model_family": "tft",
+                "trained_this_run": False,
+                "model_path": model_path(bundle.file_name, model_name, save_dir=save_dir),
+                "n_dev": len(bundle.dev_df),
+                "n_test": len(bundle.test_df),
+                "n_folds": len(bundle.folds),
+                **test_metrics,
+            }
+            row = {k if k.startswith("test_") or k in {"dataset","task","model","model_family","trained_this_run","model_path","n_dev","n_test","n_folds"} else f"test_{k}": v for k, v in row.items()}
+            rows.append(row)
+            continue
+
+        fold_records = []
         if RUN_TFT_LIGHT_CV:
-            for i, fold in enumerate(folds, start=1):
-                train_df = dev_df.iloc[fold.train_idx].reset_index(drop=True)
-                valid_df = dev_df.iloc[fold.valid_idx].reset_index(drop=True)
+            usable_folds = bundle.folds[-min(5, len(bundle.folds)):]
+            for i, fold in enumerate(usable_folds, start=1):
+                train_df = bundle.dev_df.iloc[fold.train_idx].reset_index(drop=True)
+                valid_df = bundle.dev_df.iloc[fold.valid_idx].reset_index(drop=True)
 
                 metrics = fit_fold_and_score(
-                    dataset_name=file_name,
+                    dataset_name=bundle.file_name,
                     model_name=model_name,
                     cfg=cfg,
-                    task=task,
+                    task=bundle.task,
                     train_df=train_df,
                     valid_df=valid_df,
-                    target_col=target_col,
-                    feature_cols=feature_cols,
+                    target_col=bundle.target_col,
+                    feature_cols=bundle.feature_cols,
+                    work_dir=work_dir,
                 )
                 metrics["fold"] = i
                 metrics["fold_start"] = int(fold.valid_idx[0])
@@ -953,66 +989,369 @@ def run_tft_cv_for_dataset(
                 fold_records.append(metrics)
 
         cv_summary = summarize_fold_metrics(fold_records)
-        test_result = fit_final_and_test(
-            dataset_name=file_name,
+
+        final_results = final_fit_and_test(
+            dataset_name=bundle.file_name,
             model_name=model_name,
             cfg=cfg,
-            task=task,
-            final_train_df=final_train_df,
-            final_valid_df=final_valid_df,
-            test_df=test_df,
-            target_col=target_col,
-            feature_cols=feature_cols,
+            task=bundle.task,
+            dev_df=bundle.dev_df,
+            test_df=bundle.test_df,
+            target_col=bundle.target_col,
+            feature_cols=bundle.feature_cols,
+            save_dir=save_dir,
+            work_dir=work_dir,
+            extra_meta={
+                "training_mode": "standard",
+                "test_size": test_size,
+                "min_train_size": min_train_size,
+                "valid_size": valid_size,
+                "step_size": step_size,
+            },
         )
 
-        row = build_output_row(
-            file_name=file_name,
-            task=task,
-            model_name=model_name,
-            dev_df=dev_df,
-            test_df=test_df,
-            folds=folds,
-            cv_summary=cv_summary,
-            test_result=test_result,
-        )
-        all_results.append(row)
+        row = {
+            "dataset": bundle.file_name,
+            "task": bundle.task,
+            "model": model_name,
+            "model_family": "tft",
+            "trained_this_run": True,
+            "model_path": final_results["model_path"],
+            "n_dev": len(bundle.dev_df),
+            "n_test": len(bundle.test_df),
+            "n_folds": len(bundle.folds),
+            **cv_summary,
+        }
+        for k, v in final_results.items():
+            if k.startswith("test_"):
+                row[k] = v
 
-    return pd.DataFrame(all_results)
+        rows.append(row)
+
+    out_df = pd.DataFrame(rows)
+    os.makedirs(result_dir, exist_ok=True)
+
+    out_path = os.path.join(
+        result_dir,
+        f"tft_model_comparison_{file_name.replace('.csv', '')}.csv",
+    )
+    out_df.to_csv(out_path, index=False)
+    print(f"Saved TFT results to {out_path}")
+    return out_df
 
 
-def run_all_tft_datasets(split_mode: str = "expanding") -> pd.DataFrame:
+def run_all_tft_datasets(
+    force_retrain: bool = False,
+    save_dir: str = MODEL_DIR,
+    result_filename: str = MAIN_RESULTS_FILENAME,
+    result_dir: str = RESULTS_DIR,
+    work_dir: str = WORK_DIR,
+) -> pd.DataFrame:
     ensure_dirs()
 
-    result_frames: List[pd.DataFrame] = []
-    exploratory_frames: List[pd.DataFrame] = []
+    frames = []
+    for file_name in TFT_DATASET_CONFIG:
+        print(f"[TFT] Running dataset: {file_name}")
+        df = run_tft_cv_for_dataset(
+            file_name=file_name,
+            force_retrain=force_retrain,
+            save_dir=save_dir,
+            result_dir=result_dir,
+            work_dir=work_dir,
+        )
+        frames.append(df)
 
-    for file_name, cfg in TFT_DATASET_CONFIG.items():
-        result_df = run_tft_cv_for_dataset(file_name, split_mode=split_mode)
-        if result_df.empty:
-            continue
+    final_df = pd.concat(frames, axis=0, ignore_index=True)
+    out_path = os.path.join(result_dir, result_filename)
+    final_df.to_csv(out_path, index=False)
+    print(f"Saved main TFT results to {out_path}")
+    return final_df
 
-        if cfg["task"] == "classification":
-            exploratory_frames.append(result_df)
-        else:
-            result_frames.append(result_df)
 
-    main_df = pd.concat(result_frames, axis=0, ignore_index=True) if result_frames else pd.DataFrame()
-    exploratory_df = (
-        pd.concat(exploratory_frames, axis=0, ignore_index=True) if exploratory_frames else pd.DataFrame()
+# -------------------------------------------------------------------
+# Bootstrap retraining
+# -------------------------------------------------------------------
+
+def fit_bootstrap_tft_and_score(
+    bundle: TFTBundle,
+    model_name: str,
+    cfg: Dict,
+    bootstrap_sample: BootstrapSample,
+    bootstrap_id: int,
+    save_models: bool,
+    save_dir: str,
+    work_dir: str,
+) -> Dict[str, object]:
+    boot_idx = bootstrap_sample.sample_idx
+    boot_dev_df = bundle.dev_df.iloc[boot_idx].reset_index(drop=True)
+
+    final_results = final_fit_and_test(
+        dataset_name=bundle.file_name,
+        model_name=model_name,
+        cfg=cfg,
+        task=bundle.task,
+        dev_df=boot_dev_df,
+        test_df=bundle.test_df,
+        target_col=bundle.target_col,
+        feature_cols=bundle.feature_cols,
+        save_dir=save_dir if save_models else save_dir,
+        suffix=f"bootstrap_{bootstrap_id:04d}" if save_models else "",
+        work_dir=work_dir,
+        extra_meta={
+            "training_mode": "bootstrap_retrain",
+            "bootstrap_id": bootstrap_id,
+            "bootstrap_method": bootstrap_sample.method,
+            "block_length": bootstrap_sample.block_length,
+            "bootstrap_seed": bootstrap_sample.seed,
+        },
     )
 
-    main_out_path = os.path.join(RESULTS_DIR, MAIN_RESULTS_FILENAME)
-    main_df.to_csv(main_out_path, index=False)
-    print(f"Saved main TFT results to {main_out_path}")
+    row = {
+        "dataset": bundle.file_name,
+        "task": bundle.task,
+        "model": model_name,
+        "model_family": "tft",
+        "training_mode": "bootstrap_retrain",
+        "bootstrap_id": int(bootstrap_id),
+        "bootstrap_method": bootstrap_sample.method,
+        "block_length": int(bootstrap_sample.block_length),
+        "bootstrap_seed": int(bootstrap_sample.seed) if bootstrap_sample.seed is not None else np.nan,
+        "bootstrap_unique_fraction": float(bootstrap_sample.unique_fraction),
+        "n_dev_original": len(bundle.dev_df),
+        "n_dev_bootstrap": len(boot_dev_df),
+        "n_test": len(bundle.test_df),
+        "trained_this_run": True,
+        "model_path": final_results["model_path"] if save_models else "",
+    }
+    for k, v in final_results.items():
+        if k.startswith("test_"):
+            row[k] = v
+    return row
 
-    if RUN_TFT_CLASSIFICATION:
-        exploratory_out_path = os.path.join(RESULTS_DIR, EXPLORATORY_RESULTS_FILENAME)
-        exploratory_df.to_csv(exploratory_out_path, index=False)
-        print(f"Saved exploratory TFT classification results to {exploratory_out_path}")
 
-    return main_df
+def run_tft_bootstrap_for_dataset(
+    file_name: str,
+    n_bootstrap: int = 20,
+    bootstrap_method: str = "stationary",
+    block_length: Optional[int] = None,
+    base_seed: int = 42,
+    save_models: bool = False,
+    save_dir: str = ROBUSTNESS_DIR,
+    result_dir: str = ROBUSTNESS_RESULTS_DIR,
+    work_dir: str = ROBUSTNESS_WORK_DIR,
+) -> pd.DataFrame:
+    ensure_dirs()
+
+    bundle = build_tft_bundle(file_name=file_name)
+
+    if block_length is None:
+        block_length = suggest_block_length(len(bundle.dev_df), rule="sqrt", min_block_length=5)
+
+    rows = []
+
+    for model_name, cfg in TFT_MODEL_CONFIGS.items():
+        if bundle.task == "classification" and not RUN_TFT_CLASSIFICATION:
+            continue
+
+        print(
+            f"[TFT BOOTSTRAP] dataset={bundle.file_name} model={model_name} "
+            f"method={bootstrap_method} block_length={block_length} n_bootstrap={n_bootstrap}"
+        )
+
+        for b, sample in enumerate(
+            iter_bootstrap_samples(
+                n_samples=len(bundle.dev_df),
+                n_bootstrap=n_bootstrap,
+                method=bootstrap_method,
+                block_length=block_length,
+                base_seed=base_seed,
+            ),
+            start=1,
+        ):
+            row = fit_bootstrap_tft_and_score(
+                bundle=bundle,
+                model_name=model_name,
+                cfg=cfg,
+                bootstrap_sample=sample,
+                bootstrap_id=b,
+                save_models=save_models,
+                save_dir=save_dir,
+                work_dir=work_dir,
+            )
+            rows.append(row)
+
+    out_df = pd.DataFrame(rows)
+    os.makedirs(result_dir, exist_ok=True)
+
+    out_path = os.path.join(
+        result_dir,
+        f"tft_bootstrap_{file_name.replace('.csv', '')}_{bootstrap_method}.csv",
+    )
+    out_df.to_csv(out_path, index=False)
+    print(f"Saved TFT bootstrap details to {out_path}")
+
+    summary_df = summarize_tft_bootstrap_results(out_df)
+    summary_path = os.path.join(
+        result_dir,
+        f"tft_bootstrap_summary_{file_name.replace('.csv', '')}_{bootstrap_method}.csv",
+    )
+    summary_df.to_csv(summary_path, index=False)
+    print(f"Saved TFT bootstrap summary to {summary_path}")
+
+    return out_df
+
+
+def summarize_tft_bootstrap_results(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    group_cols = ["dataset", "task", "model", "model_family", "training_mode", "bootstrap_method", "block_length"]
+
+    numeric_cols = [
+        col for col in df.columns
+        if col.startswith("test_") and pd.api.types.is_numeric_dtype(df[col])
+    ]
+
+    rows = []
+    for keys, grp in df.groupby(group_cols, dropna=False):
+        row = {col: val for col, val in zip(group_cols, keys)}
+        row["n_bootstrap"] = int(len(grp))
+
+        for col in numeric_cols:
+            vals = grp[col].dropna().astype(float).values
+            if len(vals) == 0:
+                continue
+
+            row[f"{col}_mean"] = float(np.mean(vals))
+            row[f"{col}_std"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+            row[f"{col}_median"] = float(np.median(vals))
+            row[f"{col}_ci_low_95"] = float(np.quantile(vals, 0.025))
+            row[f"{col}_ci_high_95"] = float(np.quantile(vals, 0.975))
+
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(["dataset", "model"]).reset_index(drop=True)
+
+
+def run_tft_bootstrap_all_datasets(
+    n_bootstrap: int = 20,
+    bootstrap_method: str = "stationary",
+    block_length: Optional[int] = None,
+    base_seed: int = 42,
+    save_models: bool = False,
+    save_dir: str = ROBUSTNESS_DIR,
+    result_dir: str = ROBUSTNESS_RESULTS_DIR,
+    work_dir: str = ROBUSTNESS_WORK_DIR,
+) -> pd.DataFrame:
+    ensure_dirs()
+
+    frames = []
+    for file_name in TFT_DATASET_CONFIG:
+        df = run_tft_bootstrap_for_dataset(
+            file_name=file_name,
+            n_bootstrap=n_bootstrap,
+            bootstrap_method=bootstrap_method,
+            block_length=block_length,
+            base_seed=base_seed,
+            save_models=save_models,
+            save_dir=save_dir,
+            result_dir=result_dir,
+            work_dir=work_dir,
+        )
+        frames.append(df)
+
+    final_df = pd.concat(frames, axis=0, ignore_index=True)
+
+    out_path = os.path.join(
+        result_dir,
+        f"tft_bootstrap_all_{bootstrap_method}.csv",
+    )
+    final_df.to_csv(out_path, index=False)
+    print(f"Saved combined TFT bootstrap details to {out_path}")
+
+    summary_df = summarize_tft_bootstrap_results(final_df)
+    summary_path = os.path.join(
+        result_dir,
+        f"tft_bootstrap_all_summary_{bootstrap_method}.csv",
+    )
+    summary_df.to_csv(summary_path, index=False)
+    print(f"Saved combined TFT bootstrap summary to {summary_path}")
+
+    return final_df
+
+
+# -------------------------------------------------------------------
+# Walk-forward detail
+# -------------------------------------------------------------------
+
+def run_tft_walk_forward_detail_for_dataset(
+    file_name: str,
+    result_dir: str = ROBUSTNESS_RESULTS_DIR,
+    work_dir: str = ROBUSTNESS_WORK_DIR,
+) -> pd.DataFrame:
+    ensure_dirs()
+
+    bundle = build_tft_bundle(file_name=file_name)
+    rows = []
+
+    for model_name, cfg in TFT_MODEL_CONFIGS.items():
+        if bundle.task == "classification" and not RUN_TFT_CLASSIFICATION:
+            continue
+
+        usable_folds = bundle.folds if not RUN_TFT_LIGHT_CV else bundle.folds[-min(5, len(bundle.folds)):]
+
+        for i, fold in enumerate(usable_folds, start=1):
+            train_df = bundle.dev_df.iloc[fold.train_idx].reset_index(drop=True)
+            valid_df = bundle.dev_df.iloc[fold.valid_idx].reset_index(drop=True)
+
+            metrics = fit_fold_and_score(
+                dataset_name=bundle.file_name,
+                model_name=model_name,
+                cfg=cfg,
+                task=bundle.task,
+                train_df=train_df,
+                valid_df=valid_df,
+                target_col=bundle.target_col,
+                feature_cols=bundle.feature_cols,
+                work_dir=work_dir,
+            )
+
+            row = {
+                "dataset": bundle.file_name,
+                "task": bundle.task,
+                "model": model_name,
+                "model_family": "tft",
+                "fold": i,
+                "train_start_idx": int(fold.train_idx[0]),
+                "train_end_idx": int(fold.train_idx[-1]),
+                "valid_start_idx": int(fold.valid_idx[0]),
+                "valid_end_idx": int(fold.valid_idx[-1]),
+                "train_size_effective": int(len(fold.train_idx)),
+                "valid_size": int(len(fold.valid_idx)),
+                "valid_start_date": str(bundle.dev_df.iloc[fold.valid_idx[0]]["Date"].date()),
+                "valid_end_date": str(bundle.dev_df.iloc[fold.valid_idx[-1]]["Date"].date()),
+            }
+            row.update(metrics)
+            rows.append(row)
+
+    out_df = pd.DataFrame(rows)
+    os.makedirs(result_dir, exist_ok=True)
+
+    out_path = os.path.join(
+        result_dir,
+        f"tft_walk_forward_detail_{file_name.replace('.csv', '')}.csv",
+    )
+    out_df.to_csv(out_path, index=False)
+    print(f"Saved TFT walk-forward detail to {out_path}")
+    return out_df
 
 
 if __name__ == "__main__":
-    df = run_all_tft_datasets(split_mode="expanding")
+    df = run_all_tft_datasets(
+        force_retrain=False,
+        save_dir=MODEL_DIR,
+        result_filename=MAIN_RESULTS_FILENAME,
+        result_dir=RESULTS_DIR,
+        work_dir=WORK_DIR,
+    )
     print(df)
