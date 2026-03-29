@@ -42,7 +42,7 @@ FINAL_VALID_SIZE = DEFAULT_VALID_SIZE
 
 TRAINING_CONFIG = {
     "epochs": 30,
-    "batch_size": 128,
+    "batch_size": 64,
     "learning_rate": 1e-3,
     "weight_decay": 1e-5,
     "patience": 5,
@@ -459,7 +459,59 @@ def run_deep_cv_for_dataset(
     for model_name, (model_type, model_params) in get_deep_models().items():
         checkpoint_path = model_checkpoint_path(file_name, model_name)
         if skip_existing and os.path.exists(checkpoint_path):
-            print(f"[SKIP] {file_name} / {model_name} already trained: {checkpoint_path}")
+  
+            print(f"[SKIP TRAIN] {file_name} / {model_name} already trained")
+
+            # ----------------------------
+            # LOAD MODEL
+            # ----------------------------
+            checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+
+            model = build_model(
+                model_type=checkpoint["model_type"],
+                input_dim=X_dev_raw.shape[2],
+                seq_len=checkpoint["seq_len"],
+                params=checkpoint["model_params"],
+            )
+            model.load_state_dict(checkpoint["model_state_dict"])
+            model = model.to(DEVICE)
+
+            # ----------------------------
+            # REBUILD SCALER
+            # ----------------------------
+            scaler = StandardScaler()
+            scaler.mean_ = checkpoint["scaler_mean_"]
+            scaler.scale_ = checkpoint["scaler_scale_"]
+
+            # scale test
+            X_test = apply_feature_scaler(scaler, X_test_raw)
+
+            test_loader = make_dataloader(
+                X=X_test,
+                y=y_test,
+                batch_size=TRAINING_CONFIG["batch_size"],
+                shuffle=False,
+            )
+
+            # ----------------------------
+            # EVALUATE
+            # ----------------------------
+            _, test_metrics = evaluate_model(model, test_loader, task)
+
+            row = {
+                "dataset": file_name,
+                "task": task,
+                "model": model_name,
+                "model_family": "deep_learning",
+                "trained_this_run": False,
+                "model_path": checkpoint_path,
+                "n_dev": len(X_dev_raw),
+                "n_test": len(X_test_raw),
+                "n_folds": len(folds),
+                **{f"test_{k}": v for k, v in test_metrics.items()},
+            }
+
+            results.append(row)
             continue
 
         print(f"[DEEP] {file_name} / {model_name} / task={task}")

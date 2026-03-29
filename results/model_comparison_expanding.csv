@@ -35,7 +35,7 @@ dataset_volatility.csv,regression,svr_rbf_c10_g01,models_saved\dataset_volatilit
 dataset_volatility.csv,regression,svr_rbf_c10_g001,models_saved\dataset_volatility__svr_rbf_c10_g001.pkl,False,3175,794,125,0.006426147624357261,0.004754773971292047,-0.18988740890446754,1.0,,,,,
 dataset_volatility.csv,regression,rf_d4_leaf3,models_saved\dataset_volatility__rf_d4_leaf3.pkl,False,3175,794,125,0.005435472340461579,0.003074688106253583,0.14870701852346724,1.0,,,,,
 dataset_volatility.csv,regression,rf_d6_leaf5,models_saved\dataset_volatility__rf_d6_leaf5.pkl,False,3175,794,125,0.005469330462754264,0.003090393426072598,0.13806840190988745,1.0,,,,,
-dataset_volatility.csv,regression,rf_d8_leaf10,models_saved\dataset_volatility__rf_d8_leaf10.pkl,False,3175,794,125,0.005404522826186753,0.0031150929279799774,0.15837392236875214,1.0,,,,,
+dataset_volatility.csv,regression,rf_d8_leaf10,models_saved\dataset_volatility__rf_d8_leaf10.pkl,False,3175,794,125,0.005404522826186752,0.003115092927979978,0.15837392236875225,1.0,,,,,
 dataset_volatility.csv,regression,xgb_d3_lr005,models_saved\dataset_volatility__xgb_d3_lr005.pkl,False,3175,794,125,0.0051541740130294335,0.0030517521667705817,0.23453977886373756,1.0,,,,,
 dataset_volatility.csv,regression,xgb_d5_lr005,models_saved\dataset_volatility__xgb_d5_lr005.pkl,False,3175,794,125,0.005030387798721508,0.0030446855415083864,0.2708659063137374,1.0,,,,,
 dataset_volatility.csv,regression,xgb_d5_lr01,models_saved\dataset_volatility__xgb_d5_lr01.pkl,False,3175,794,125,0.005047337507055434,0.0031195739480230555,0.2659440467422769,1.0,,,,,

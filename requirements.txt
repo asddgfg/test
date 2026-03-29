@@ -5,4 +5,4 @@ xgboost>=2.0
 joblib>=1.3
 yfinance>=0.2
 torch>=2.2
-u8darts[torch]
+darts[torch]>=0.41.0
