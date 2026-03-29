@@ -15,6 +15,8 @@ from sklearn.metrics import (
     mean_squared_error,
     r2_score,
 )
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
 
 from splitter import train_dev_test_split, rolling_window_splits, expanding_window_splits
 from models import get_regression_models, get_classification_models
@@ -82,9 +84,54 @@ def save_model(model, dataset_name: str, model_name: str) -> str:
     return path
 
 
+def _patch_legacy_model_after_load(model):
+    """
+    Patch older sklearn model objects loaded from joblib so they remain usable
+    in newer sklearn environments.
+
+    This is especially helpful for legacy LogisticRegression objects that may
+    be missing newer runtime attributes accessed by predict()/predict_proba().
+    """
+    try:
+        final_est = model.steps[-1][1] if isinstance(model, Pipeline) else model
+
+        if isinstance(final_est, LogisticRegression):
+            # Common missing attrs seen across sklearn version differences
+            if not hasattr(final_est, "multi_class"):
+                final_est.multi_class = "auto"
+
+            if not hasattr(final_est, "n_jobs"):
+                final_est.n_jobs = None
+
+            if not hasattr(final_est, "l1_ratio"):
+                final_est.l1_ratio = None
+
+            if not hasattr(final_est, "class_weight"):
+                final_est.class_weight = None
+
+            if not hasattr(final_est, "solver"):
+                final_est.solver = "lbfgs"
+
+            if not hasattr(final_est, "penalty"):
+                final_est.penalty = "l2"
+
+            if not hasattr(final_est, "max_iter"):
+                final_est.max_iter = 100
+
+            if not hasattr(final_est, "random_state"):
+                final_est.random_state = None
+
+    except Exception as e:
+        print(f"[WARN] Legacy model patch failed: {e}")
+
+    return model
+
+
 def load_model(dataset_name: str, model_name: str):
     path = get_model_path(dataset_name, model_name)
-    return joblib.load(path)
+    model = joblib.load(path)
+    model = _patch_legacy_model_after_load(model)
+    return model
 
 
 def load_dataset(file_name: str) -> pd.DataFrame:
@@ -142,6 +189,37 @@ def classification_metrics(
     return out
 
 
+def _safe_predict_proba(model, X) -> np.ndarray | None:
+    """
+    Return positive-class probability if available.
+    Falls back to decision_function -> sigmoid-like mapping if needed.
+    If neither is available, return None.
+    """
+    if hasattr(model, "predict_proba"):
+        try:
+            prob = model.predict_proba(X)
+            if prob.ndim == 2 and prob.shape[1] >= 2:
+                return prob[:, 1]
+            if prob.ndim == 1:
+                return prob
+        except Exception as e:
+            print(f"[WARN] predict_proba failed: {e}")
+
+    if hasattr(model, "decision_function"):
+        try:
+            scores = model.decision_function(X)
+            scores = np.asarray(scores)
+
+            # Binary case: convert score to pseudo-probability
+            if scores.ndim == 1:
+                return 1.0 / (1.0 + np.exp(-scores))
+
+        except Exception as e:
+            print(f"[WARN] decision_function fallback failed: {e}")
+
+    return None
+
+
 def evaluate_one_fold(model, X_train, y_train, X_valid, y_valid, task: str) -> Dict[str, float]:
     model.fit(X_train, y_train)
     y_pred = model.predict(X_valid)
@@ -149,10 +227,7 @@ def evaluate_one_fold(model, X_train, y_train, X_valid, y_valid, task: str) -> D
     if task == "regression":
         return regression_metrics(y_valid.values, y_pred)
 
-    y_prob = None
-    if hasattr(model, "predict_proba"):
-        y_prob = model.predict_proba(X_valid)[:, 1]
-
+    y_prob = _safe_predict_proba(model, X_valid)
     return classification_metrics(y_valid.values, y_pred, y_prob)
 
 
@@ -177,11 +252,61 @@ def evaluate_on_test(model, X_test, y_test, task: str) -> Dict[str, float]:
     if task == "regression":
         return regression_metrics(y_test.values, y_test_pred)
 
-    y_test_prob = None
-    if hasattr(model, "predict_proba"):
-        y_test_prob = model.predict_proba(X_test)[:, 1]
-
+    y_test_prob = _safe_predict_proba(model, X_test)
     return classification_metrics(y_test.values, y_test_pred, y_test_prob)
+
+
+def _train_and_evaluate_model(
+    fresh_model,
+    file_name: str,
+    model_name: str,
+    model_path: str,
+    task: str,
+    folds,
+    X_dev: pd.DataFrame,
+    y_dev: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    dev_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> Dict[str, object]:
+    print(f"Training missing/incompatible model: {file_name} / {model_name}")
+    model = fresh_model
+    fold_records = []
+
+    for i, fold in enumerate(folds, start=1):
+        X_train = X_dev.iloc[fold.train_idx]
+        y_train = y_dev.iloc[fold.train_idx]
+        X_valid = X_dev.iloc[fold.valid_idx]
+        y_valid = y_dev.iloc[fold.valid_idx]
+
+        metrics = evaluate_one_fold(model, X_train, y_train, X_valid, y_valid, task)
+        metrics["fold"] = i
+        fold_records.append(metrics)
+
+    cv_summary = summarize_fold_metrics(fold_records)
+
+    model.fit(X_dev, y_dev)
+    save_model(model, file_name, model_name)
+
+    test_metrics = evaluate_on_test(model, X_test, y_test, task)
+
+    row = {
+        "dataset": file_name,
+        "task": task,
+        "model": model_name,
+        "model_path": model_path,
+        "trained_this_run": True,
+        "n_dev": len(dev_df),
+        "n_test": len(test_df),
+        "n_folds": len(folds),
+        **cv_summary,
+    }
+
+    for k, v in test_metrics.items():
+        row[f"test_{k}"] = v
+
+    return row
 
 
 def run_cv_for_dataset(
@@ -246,62 +371,49 @@ def run_cv_for_dataset(
 
         if model_exists(file_name, model_name):
             print(f"Loading existing model: {file_name} / {model_name}")
-            model = load_model(file_name, model_name)
 
-            test_metrics = evaluate_on_test(model, X_test, y_test, task)
+            try:
+                model = load_model(file_name, model_name)
+                test_metrics = evaluate_on_test(model, X_test, y_test, task)
 
-            row = {
-                "dataset": file_name,
-                "task": task,
-                "model": model_name,
-                "model_path": model_path,
-                "trained_this_run": False,
-                "n_dev": len(dev_df),
-                "n_test": len(test_df),
-                "n_folds": len(folds),
-            }
-            for k, v in test_metrics.items():
-                row[f"test_{k}"] = v
+                row = {
+                    "dataset": file_name,
+                    "task": task,
+                    "model": model_name,
+                    "model_path": model_path,
+                    "trained_this_run": False,
+                    "n_dev": len(dev_df),
+                    "n_test": len(test_df),
+                    "n_folds": len(folds),
+                }
+                for k, v in test_metrics.items():
+                    row[f"test_{k}"] = v
 
-            all_results.append(row)
-            continue
+                all_results.append(row)
+                continue
 
-        print(f"Training missing model: {file_name} / {model_name}")
-        model = fresh_model
-        fold_records = []
+            except Exception as e:
+                print(f"[WARN] Failed to evaluate loaded model {file_name} / {model_name}: {e}")
+                print("       Treating it as incompatible legacy model. Deleting and retraining...")
+                try:
+                    os.remove(model_path)
+                except OSError as remove_err:
+                    print(f"[WARN] Could not remove broken model file: {remove_err}")
 
-        for i, fold in enumerate(folds, start=1):
-            X_train = X_dev.iloc[fold.train_idx]
-            y_train = y_dev.iloc[fold.train_idx]
-            X_valid = X_dev.iloc[fold.valid_idx]
-            y_valid = y_dev.iloc[fold.valid_idx]
-
-            metrics = evaluate_one_fold(model, X_train, y_train, X_valid, y_valid, task)
-            metrics["fold"] = i
-            fold_records.append(metrics)
-
-        cv_summary = summarize_fold_metrics(fold_records)
-
-        model.fit(X_dev, y_dev)
-        save_model(model, file_name, model_name)
-
-        test_metrics = evaluate_on_test(model, X_test, y_test, task)
-
-        row = {
-            "dataset": file_name,
-            "task": task,
-            "model": model_name,
-            "model_path": model_path,
-            "trained_this_run": True,
-            "n_dev": len(dev_df),
-            "n_test": len(test_df),
-            "n_folds": len(folds),
-            **cv_summary,
-        }
-
-        for k, v in test_metrics.items():
-            row[f"test_{k}"] = v
-
+        row = _train_and_evaluate_model(
+            fresh_model=fresh_model,
+            file_name=file_name,
+            model_name=model_name,
+            model_path=model_path,
+            task=task,
+            folds=folds,
+            X_dev=X_dev,
+            y_dev=y_dev,
+            X_test=X_test,
+            y_test=y_test,
+            dev_df=dev_df,
+            test_df=test_df,
+        )
         all_results.append(row)
 
     return pd.DataFrame(all_results)
