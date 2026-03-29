@@ -191,7 +191,7 @@ def run_cv_for_dataset(
     train_size: int = 504,
     min_train_size: int = 504,
     valid_size: int = 63,
-    step_size: int = 63,
+    step_size: int = 21,
 ) -> pd.DataFrame:
     ensure_dirs()
 
