@@ -29,6 +29,9 @@ from splitter import expanding_window_splits, train_dev_test_split
 
 warnings.filterwarnings("ignore")
 
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("high")
+
 
 PROCESSED_DIR = "data/processed"
 RESULTS_DIR = "results"
@@ -150,6 +153,11 @@ def load_dataset(file_name: str) -> pd.DataFrame:
 
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
+
+    numeric_cols = [col for col in df.columns if col != "Date"]
+    if numeric_cols:
+        df[numeric_cols] = df[numeric_cols].astype(np.float32)
+
     return df
 
 
@@ -169,12 +177,17 @@ def get_feature_columns(df: pd.DataFrame, target_col: str) -> List[str]:
 
 def build_series_from_df(df: pd.DataFrame, value_cols: List[str]) -> TimeSeries:
     local_df = with_local_time_idx(df)
+    local_df[value_cols] = local_df[value_cols].astype(np.float32)
     return TimeSeries.from_dataframe(
         local_df,
         time_col="time_idx",
         value_cols=value_cols,
         fill_missing_dates=False,
-    )
+    ).astype(np.float32)
+
+
+def ensure_series_float32(series: TimeSeries) -> TimeSeries:
+    return series.astype(np.float32)
 
 
 def build_target_series(df: pd.DataFrame, target_col: str) -> TimeSeries:
@@ -322,17 +335,17 @@ def prepare_scaled_series(
     valid_cov = build_covariate_series(valid_df, feature_cols)
 
     cov_scaler = Scaler()
-    train_cov_scaled = cov_scaler.fit_transform(train_cov)
-    valid_cov_scaled = cov_scaler.transform(valid_cov)
+    train_cov_scaled = ensure_series_float32(cov_scaler.fit_transform(train_cov))
+    valid_cov_scaled = ensure_series_float32(cov_scaler.transform(valid_cov))
 
     if task == "regression":
         target_scaler: Optional[Scaler] = Scaler()
-        train_target_scaled = target_scaler.fit_transform(train_target)
-        valid_target_scaled = target_scaler.transform(valid_target)
+        train_target_scaled = ensure_series_float32(target_scaler.fit_transform(train_target))
+        valid_target_scaled = ensure_series_float32(target_scaler.transform(valid_target))
     elif task == "classification":
         target_scaler = None
-        train_target_scaled = train_target
-        valid_target_scaled = valid_target
+        train_target_scaled = ensure_series_float32(train_target)
+        valid_target_scaled = ensure_series_float32(valid_target)
     else:
         raise ValueError(f"Unsupported task: {task}")
 
@@ -474,7 +487,7 @@ def fit_one_model(
 
     # Supported in newer Darts versions; guarded for compatibility.
     dataloader_kwargs = {
-        "num_workers": 4 if torch.cuda.is_available() else 0,
+        "num_workers": 8 if torch.cuda.is_available() else 0,
         "pin_memory": bool(torch.cuda.is_available()),
     }
     if torch.cuda.is_available() and dataloader_kwargs["num_workers"] > 0:
@@ -510,13 +523,13 @@ def fit_fold_and_score(
     )
 
     combined_df = pd.concat([train_df, valid_df], axis=0, ignore_index=True)
-    combined_cov_scaled = prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+    combined_cov_scaled = ensure_series_float32(prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols)))
 
     if task == "regression":
         if prepared.target_scaler is None:
             raise ValueError("Regression task requires a fitted target scaler.")
 
-        combined_target_scaled = prepared.target_scaler.transform(build_target_series(combined_df, target_col))
+        combined_target_scaled = ensure_series_float32(prepared.target_scaler.transform(build_target_series(combined_df, target_col)))
         combined_target_unscaled = build_target_series(combined_df, target_col)
         y_true, y_pred = get_historical_regression_predictions(
             model=fold_model,
@@ -563,13 +576,13 @@ def fit_final_and_test(
     )
 
     combined_df = pd.concat([final_train_df, final_valid_df, test_df], axis=0, ignore_index=True)
-    combined_cov_scaled = prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols))
+    combined_cov_scaled = ensure_series_float32(prepared.cov_scaler.transform(build_covariate_series(combined_df, feature_cols)))
 
     if task == "regression":
         if prepared.target_scaler is None:
             raise ValueError("Regression task requires a fitted target scaler.")
 
-        combined_target_scaled = prepared.target_scaler.transform(build_target_series(combined_df, target_col))
+        combined_target_scaled = ensure_series_float32(prepared.target_scaler.transform(build_target_series(combined_df, target_col)))
         combined_target_unscaled = build_target_series(combined_df, target_col)
         y_true, y_pred = get_historical_regression_predictions(
             model=final_model,
