@@ -44,7 +44,7 @@ RUN_TFT_CLASSIFICATION = True
 # Main speed / robustness switch.
 # False: final train + test only (recommended for TFT)
 # True: run a very light expanding-window CV before final training
-RUN_TFT_LIGHT_CV = True
+RUN_TFT_LIGHT_CV = False
 
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_MIN_TRAIN_SIZE = 504
